@@ -1,0 +1,79 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [backend]
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - ./data:/app/data
+    networks: [backend]
+
+  gowa:
+    image: aldinokemal2104/go-whatsapp-web-multidevice:v9.3.1
+    restart: unless-stopped
+    environment:
+      APP_PORT: "3000"
+      APP_DEBUG: "false"
+      APP_OS: "Multitek Service"
+      APP_BASIC_AUTH: "${GOWA_BASIC_AUTH_USER}:${GOWA_BASIC_AUTH_PASSWORD}"
+      WHATSAPP_WEBHOOK: "http://api:8080/webhooks/gowa"
+      WHATSAPP_WEBHOOK_SECRET: "${GOWA_WEBHOOK_SECRET}"
+      WHATSAPP_WEBHOOK_EVENTS: "message"
+      WHATSAPP_AUTO_MARK_READ: "true"
+      WHATSAPP_AUTO_DOWNLOAD_MEDIA: "true"
+      WHATSAPP_WEBHOOK_IGNORE_JIDS: "@g.us"
+    command: ["rest"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - gowa_storage:/app/storages
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  pg_data:
+  gowa_storage:

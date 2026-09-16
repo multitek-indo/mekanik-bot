@@ -1,0 +1,11 @@
+Multitek Service MVP v0.2.0 - Build Verification
+
+Python compile : PASS
+Unit tests     : 15 passed
+Shell syntax   : PASS
+Secret prefix scan: no obvious committed private-key/API-key prefix found
+
+Note:
+- Live Docker/PostgreSQL/GOWA integration was not executed in the build container.
+- Run scripts/preflight.sh and scripts/health.sh on the target VPS.
+- Pair a real WhatsApp device and execute the end-to-end acceptance flow before production use.
