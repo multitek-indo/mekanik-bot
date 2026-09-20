@@ -255,6 +255,17 @@ def _normalize_customer_text(text: str) -> str:
         "mekanike": "mekanik",
         "teknisine": "teknisi",
         "mesine": "mesin",
+        # Javanese repair/request vocabulary
+        "tulung": "tolong",
+        "arep": "mau",
+        "pengen": "mau",
+        "kepengin": "mau",
+        "ndandani": "perbaiki",
+        "dandani": "perbaiki",
+        "didandani": "diperbaiki",
+        "benakke": "perbaiki",
+        "benerke": "perbaiki",
+        "dibenerke": "diperbaiki",
     }
 
     tokens = re.split(r"(\W+)", low)
@@ -298,6 +309,75 @@ def _looks_like_question(text: str) -> bool:
         "terus bagaimana",
     )
     return any(marker in low for marker in question_markers)
+
+def _looks_like_service_request(text: str) -> bool:
+    """Detect a natural request to actually proceed with service.
+
+    This is intentionally stricter than a generic capability question.  For
+    example, "bisa bantu perbaiki mas?" means the customer wants help, while
+    "mesin ini bisa diperbaiki tidak?" may only ask whether repair is possible.
+    """
+    low = _normalize_customer_text(text)
+    if not low:
+        return False
+
+    negative_markers = (
+        "tidak jadi",
+        "ga jadi",
+        "gak jadi",
+        "nggak jadi",
+        "ngga jadi",
+        "ora dadi",
+        "belum jadi",
+        "jangan dulu",
+        "nanti dulu",
+    )
+    if any(marker in low for marker in negative_markers):
+        return False
+
+    direct_markers = (
+        "lanjut",
+        "lanjut servis",
+        "lanjut perbaikan",
+        "proses servis",
+        "proses perbaikan",
+        "carikan mekanik",
+        "carikan teknisi",
+        "panggil mekanik",
+        "panggil teknisi",
+        "kirim mekanik",
+        "kirim teknisi",
+        "butuh mekanik",
+        "butuh teknisi",
+        "mau servis",
+        "mau perbaiki",
+        "ingin servis",
+        "ingin perbaiki",
+        "tolong servis",
+        "tolong perbaiki",
+        "tolong dibantu servis",
+        "tolong dibantu perbaiki",
+        "bisa bantu servis",
+        "bisa bantu perbaiki",
+        "bisa dibantu servis",
+        "bisa dibantu perbaiki",
+        "boleh bantu servis",
+        "boleh bantu perbaiki",
+    )
+    if any(marker in low for marker in direct_markers):
+        return True
+
+    return bool(
+        re.search(
+            r"\b(?:tolong|mau|ingin)\b.*\b(?:servis|perbaiki|diperbaiki)\b",
+            low,
+        )
+        or re.search(
+            r"\b(?:bisa|boleh)\b.*\bbantu\b.*\b(?:servis|perbaiki|diperbaiki)\b",
+            low,
+        )
+    )
+
 
 def _looks_like_problem_statement(text: str) -> bool:
     """Conservative fallback for short symptom statements.
@@ -419,7 +499,7 @@ def _clean_problem_fragment(text: str) -> str:
         cleaned = new_value
 
     cleaned = re.sub(
-        r"^(?:mesinnya|mesin saya|mesinku|mesin)\b[\s,.;:-]*",
+        r"^(?:mesinnya|mesin saya|mesinku|mesin|masalahnya|keluhannya|kendalanya)\b[\s,.;:-]*",
         "",
         cleaned,
         count=1,
@@ -742,13 +822,13 @@ async def price_answer(
         if not code:
             return (
                 f"Untuk kategori *{tier_name}*, saya perlu tahu jenis mesinnya dulu "
-                "supaya tidak mengambil matrix tarif yang salah."
+                "supaya saya tidak mengambil acuan tarif yang salah."
             )
 
         if not row:
             return (
                 f"Untuk kategori *{tier_name}* pada {label or 'mesin tersebut'}, "
-                "nominal detailnya belum tersedia di matrix. "
+                "nominal detailnya belum tersedia di acuan tarif. "
                 "Kategori dan biaya final tetap dikonfirmasi setelah diagnosis mekanik."
             )
 
@@ -756,12 +836,12 @@ async def price_answer(
         if not amount:
             return (
                 f"Untuk *{row['skill_name']}* kategori *{tier_name}*, "
-                "nominalnya belum dikunci di matrix dan masih memerlukan quotation setelah diagnosis."
+                "nominalnya belum ditetapkan dan akan dikonfirmasi setelah diagnosis."
             )
 
         return (
             f"Untuk *{row['skill_name']}* kategori *{tier_name}*, "
-            f"acuan matrix saat ini *{rupiah(amount)}*. "
+            f"acuan tarif saat ini *{rupiah(amount)}*. "
             "Kategori ringan/sedang/berat baru dipastikan setelah mekanik melakukan diagnosis. "
             "Spare part, bila diperlukan, dihitung terpisah."
         )
@@ -779,20 +859,20 @@ async def price_answer(
         if context_items:
             return (
                 base
-                + "\n\nUntuk mesin yang sudah Anda jelaskan, saya belum menemukan matrix "
-                + "yang cukup spesifik untuk memberi nominal jasa tanpa diagnosis."
+                + "\n\nUntuk mesin yang sudah Anda jelaskan, saya belum punya acuan jasa "
+                + "yang cukup spesifik untuk memberi nominal pasti sebelum diagnosis."
             )
 
         return (
             base
             + "\n\nSebutkan jenis mesin dan keluhannya kalau Anda ingin saya cek "
-            + "apakah matrix tarif detailnya sudah tersedia."
+            + "apakah acuan tarif detailnya sudah tersedia."
         )
 
     if not row:
         return (
             base
-            + "\n\nTarif jasa detail untuk kategori mesin ini belum tersedia di matrix "
+            + "\n\nTarif jasa detail untuk kategori mesin ini belum tersedia di acuan tarif "
             + "dan akan dikonfirmasi setelah diagnosis mekanik."
         )
 
@@ -805,16 +885,16 @@ async def price_answer(
         return (
             base
             + f"\n\nUntuk *{row['skill_name']}*, tarif jasa detail belum dikunci "
-            + "di matrix dan akan dikonfirmasi setelah diagnosis."
+            + "dan akan dikonfirmasi setelah diagnosis."
         )
 
     return (
         base
-        + f"\n\n*Matrix {row['skill_name']}*\n"
+        + f"\n\n*Acuan tarif {row['skill_name']}*\n"
         + f"Pengecekan: {rupiah(inspection) if inspection else 'belum ditetapkan'}\n"
-        + f"Ringan: {rupiah(light) if light else 'quotation'}\n"
-        + f"Sedang: {rupiah(medium) if medium else 'quotation'}\n"
-        + f"Berat: {rupiah(heavy) if heavy else 'quotation'}"
+        + f"Ringan: {rupiah(light) if light else 'belum ditetapkan'}\n"
+        + f"Sedang: {rupiah(medium) if medium else 'belum ditetapkan'}\n"
+        + f"Berat: {rupiah(heavy) if heavy else 'belum ditetapkan'}"
     )
 
 
@@ -1127,7 +1207,7 @@ def _state_resume_prompt(state: str, payload: dict) -> str:
         return "Kalau ada, sebutkan patokan lokasinya. Kalau tidak ada, cukup jawab *cukup* atau *tidak ada*."
 
     if state == "cust_price_context":
-        return "Kalau ingin dilanjutkan menjadi permintaan service, tinggal bilang *lanjut* atau *carikan mekanik*."
+        return "Kalau mau lanjut servis, bilang saja *bantu perbaiki* atau ceritakan detail keluhannya."
 
     if state == "cust_update_location":
         return "Untuk melanjutkan perubahan lokasi, kirim *Share Location* yang baru."
@@ -1628,10 +1708,19 @@ async def _start_intake(msg: IncomingMessage, classified: dict) -> str:
 
     if machines and machines[0].get("machine"):
         machine_label = str(machines[0]["machine"]).strip()
+        problem_label = str(machines[0].get("problem") or "").strip()
         if machine_label.lower().startswith("mesin "):
             machine_phrase = f"*{machine_label}*"
         else:
             machine_phrase = f"mesin *{machine_label}*"
+
+        if problem_label:
+            return (
+                f"Baik, saya sudah catat {machine_phrase} dengan keluhan "
+                f"*{problem_label}*. Ada berapa unit mesin yang ingin dicek? "
+                "Boleh jawab biasa seperti *satu*, *2 unit*, atau *mung siji*."
+            )
+
         return (
             f"Baik, saya menangkap {machine_phrase}. "
             "Ada berapa unit mesin yang ingin dicek? "
@@ -1684,41 +1773,91 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         analysis = await understand()
         low = _normalize_customer_text(text)
 
-        continue_markers = (
-            "kirim mekanik",
-            "kirim teknisi",
-            "panggil mekanik",
-            "panggil teknisi",
-            "carikan mekanik",
-            "carikan teknisi",
-            "butuh mekanik",
-            "butuh teknisi",
-            "mekanik ke tempat",
-            "teknisi ke tempat",
-            "ke tempatku",
-            "ke lokasi saya",
-            "ke lokasiku",
-            "lanjut",
-            "gas",
-        )
-
+        # A customer who has just asked about price may naturally say things
+        # such as "bisa bantu perbaiki mas?" instead of the exact word LANJUT.
+        # Treat that as consent to proceed with service while preserving the
+        # machine/problem context already captured from the price question.
         wants_service = (
             analysis.get("intent") == "SERVICE_REQUEST"
-            or any(marker in low for marker in continue_markers)
+            or _looks_like_service_request(text)
         )
 
-        if wants_service:
-            remembered = list(payload.get("prefill_machines") or [])
-            current = _machines_from_ai(analysis)
+        remembered = [
+            dict(item)
+            for item in list(payload.get("prefill_machines") or [])
+            if isinstance(item, dict)
+        ]
+        current = _machines_from_ai(analysis)
+
+        # A natural symptom follow-up such as "masalahnya loncat mas" is also
+        # a continuation of the service conversation, not generic chat.
+        problem_hint = _analysis_problem(analysis)
+        if (
+            not problem_hint
+            and not _looks_like_question(text)
+            and _looks_like_problem_statement(text)
+        ):
+            problem_hint = _clean_problem_fragment(text) or text[:1500]
+
+        if problem_hint and remembered:
+            incoming_machine = ""
+            if current:
+                incoming_machine = str(current[0].get("machine") or "").strip()
+
+            matched = False
+            for item in remembered:
+                old_machine = str(item.get("machine") or "").strip()
+                if incoming_machine and old_machine.lower() != incoming_machine.lower():
+                    continue
+                old_problem = str(item.get("problem") or "").strip()
+                if not old_problem or problem_hint.lower() not in old_problem.lower():
+                    item["problem"] = problem_hint[:1500]
+                matched = True
+                break
+
+            if not matched and incoming_machine:
+                remembered.append(
+                    {
+                        "machine": incoming_machine[:300],
+                        "problem": problem_hint[:1500],
+                    }
+                )
+
+            payload["prefill_machines"] = remembered[: settings.max_machines_per_order]
+
+        if wants_service or (problem_hint and remembered):
             classified = dict(analysis)
 
             if current:
-                classified["machines"] = current
+                # Merge AI extraction with the remembered context rather than
+                # discarding the machine/problem from the previous turn.
+                merged = remembered or [dict(item) for item in current]
+                for new_item in current:
+                    new_machine = str(new_item.get("machine") or "").strip()
+                    new_problem = str(new_item.get("problem") or "").strip()
+                    found = False
+                    for old_item in merged:
+                        old_machine = str(old_item.get("machine") or "").strip()
+                        if new_machine and old_machine.lower() == new_machine.lower():
+                            if new_problem:
+                                old_item["problem"] = new_problem[:1500]
+                            found = True
+                            break
+                    if not found:
+                        merged.append(dict(new_item))
+                classified["machines"] = merged[: settings.max_machines_per_order]
             elif remembered:
                 classified["machines"] = remembered
 
+            if payload.get("pending_machine_count") and not classified.get("machine_count"):
+                classified["machine_count"] = payload.get("pending_machine_count")
+
             await clear_state(msg.phone)
-            return await _start_intake(msg, classified)
+            next_reply = await _start_intake(msg, classified)
+
+            if wants_service:
+                return "Bisa, saya bantu proses servicenya.\n\n" + next_reply
+            return "Baik, keluhannya saya catat. Saya bantu lanjutkan proses servicenya.\n\n" + next_reply
 
         if (
             _looks_like_price_question(text)
@@ -1736,8 +1875,9 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         if analysis.get("control") == "GREETING":
             return (
-                "Ya. Data mesin yang tadi masih saya ingat. "
-                "Kalau ingin saya carikan mekanik, tinggal bilang lanjut."
+                "Ya, silakan. Data mesin yang tadi masih saya ingat. "
+                "Kalau mau saya proses servicenya, cukup bilang *bantu perbaiki* "
+                "atau langsung ceritakan detail keluhannya."
             )
 
         side = await _answer_side_question(
@@ -1748,6 +1888,15 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         )
         if side is not None:
             return side
+
+        # Do not drop back to a generic chatbot answer while we still hold a
+        # price/service context. Keep the conversation anchored to the machine.
+        if remembered:
+            return (
+                "Baik, data mesin yang tadi masih saya ingat. "
+                "Kalau ada detail kerusakan tambahan, ceritakan saja. "
+                "Kalau mau saya lanjutkan ke pencarian mekanik, saya bisa proses dari data itu."
+            )
 
         return await conversational_customer_reply(text)
 
@@ -2785,7 +2934,13 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
         if not context_items and active:
             context_items = await _order_context_items(active["id"])
 
-        return await price_answer(text, context_items)
+        answer = await price_answer(text, context_items)
+        if not active:
+            return (
+                answer
+                + "\n\nKalau mau, saya bisa langsung bantu proses servicenya dan carikan mekanik yang sesuai."
+            )
+        return answer
 
     if classified.get("intent") == "STATUS_QUESTION":
         if active:
@@ -2795,7 +2950,10 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
             "Jika Anda punya nomor MTK, kirim misalnya: *STATUS MTK-260919-0003*."
         )
 
-    if classified.get("intent") == "SERVICE_REQUEST":
+    if (
+        classified.get("intent") == "SERVICE_REQUEST"
+        or _looks_like_service_request(text)
+    ):
         return await _start_intake(msg, classified)
 
     # Answer common off-flow questions directly even when no intake state exists.
