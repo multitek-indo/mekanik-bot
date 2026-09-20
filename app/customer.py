@@ -196,6 +196,156 @@ def _looks_like_question(text: str) -> bool:
     return any(marker in low for marker in question_markers)
 
 
+def _looks_like_problem_statement(text: str) -> bool:
+    """Conservative fallback for short symptom statements.
+
+    AI extraction remains primary. This only prevents ordinary symptom phrases
+    such as "sering loncat mas" from being mistaken for general chat.
+    """
+    low = _normalize_customer_text(text)
+    if not low:
+        return False
+
+    symptom_markers = (
+        "error",
+        "rusak",
+        "macet",
+        "mati",
+        "loncat",
+        "loncatan",
+        "lompat",
+        "skip",
+        "putus",
+        "patah",
+        "bocor",
+        "panas",
+        "berisik",
+        "bunyi",
+        "suara",
+        "kasar",
+        "tidak jalan",
+        "tidak mau jalan",
+        "ga jalan",
+        "gak jalan",
+        "nggak jalan",
+        "ngga jalan",
+        "ora mlaku",
+        "ra mlaku",
+        "ra gelem mlaku",
+        "tidak respon",
+        "tidak merespon",
+        "ga respon",
+        "gak respon",
+        "nggak respon",
+        "ngga respon",
+        "jahitan",
+        "benang",
+        "jarum",
+        "pedal",
+        "dinamo",
+        "motor",
+        "servo",
+        "kode",
+        "ngadat",
+        "miring",
+        "tidak normal",
+        "kendala",
+        "masalah",
+        "trouble",
+    )
+    return any(marker in low for marker in symptom_markers)
+
+
+def _analysis_problem(analysis: dict | None) -> str:
+    analysis = analysis or {}
+    fields = analysis.get("fields") or {}
+    problem = str(fields.get("problem") or "").strip()
+    if problem:
+        return problem[:1500]
+
+    for item in list(analysis.get("machines") or []):
+        if not isinstance(item, dict):
+            continue
+        problem = str(item.get("problem") or "").strip()
+        if problem:
+            return problem[:1500]
+
+    return ""
+
+
+def _problem_from_count_reply(text: str, analysis: dict | None = None) -> str:
+    """Extract a symptom included together with the machine count.
+
+    Example: "Satu mas mesinnya sering loncatan" -> "sering loncatan".
+    We only use a textual fallback when it looks like a symptom, so schedule or
+    pricing questions are not stored as machine complaints.
+    """
+    extracted = _analysis_problem(analysis)
+    if extracted:
+        return extracted
+
+    if not _looks_like_problem_statement(text):
+        return ""
+
+    if _looks_like_price_question(text):
+        return ""
+
+    topic = _side_question_topic(text)
+    if topic in {
+        "schedule",
+        "mechanic_origin",
+        "warranty",
+        "payment",
+        "duration",
+        "coverage",
+        "general",
+    }:
+        return ""
+
+    low = _normalize_customer_text(text)
+
+    count_prefix = re.compile(
+        r"^(?:(?:cuma|hanya|mung)\s+)?"
+        r"(?:1|satu|sebuah|siji|2|dua|loro|3|tiga|telung|4|empat|papat|5|lima|limang)"
+        r"(?:\s*(?:unit|mesin))?\b[\s,.;:-]*",
+        flags=re.I,
+    )
+    cleaned = count_prefix.sub("", low, count=1).strip()
+
+    # Remove conversational fillers around the actual symptom.
+    for _ in range(3):
+        new = re.sub(
+            r"^(?:mas|min|pak|bu|mbak|mba|gan|ya|iya|nih|ini)\b[\s,.;:-]*",
+            "",
+            cleaned,
+            count=1,
+            flags=re.I,
+        ).strip()
+        if new == cleaned:
+            break
+        cleaned = new
+
+    cleaned = re.sub(
+        r"^(?:mesinnya|mesin saya|mesinku|mesine|mesin)\b[\s,.;:-]*",
+        "",
+        cleaned,
+        count=1,
+        flags=re.I,
+    ).strip()
+    cleaned = re.sub(
+        r"[\s,.;:-]*(?:mas|min|pak|bu|mbak|mba|gan)$",
+        "",
+        cleaned,
+        count=1,
+        flags=re.I,
+    ).strip()
+
+    if len(cleaned) < 3 or not _looks_like_problem_statement(cleaned):
+        return ""
+
+    return cleaned[:1500]
+
+
 def _price_question_kind(text: str) -> str | None:
     low = _normalize_customer_text(text)
     if not low:
@@ -927,10 +1077,10 @@ async def _answer_side_question(
         )
         return _append_resume(answer, resume)
 
-    if (
-        topic == "general"
-        or analysis.get("intent") in {"GENERAL_QUESTION", "UNKNOWN"}
-    ):
+    # Only route to free-form conversation when the text itself looks like
+    # a question. AI can occasionally label short symptom statements as
+    # GENERAL_QUESTION; those must remain available to the active intake state.
+    if topic == "general":
         answer = await conversational_customer_reply(text)
         return _append_resume(answer, resume)
 
@@ -946,7 +1096,8 @@ async def _apply_machine_count(
     if not (1 <= count <= settings.max_machines_per_order):
         return f"Jumlah mesin harus 1 sampai {settings.max_machines_per_order}."
 
-    source = list(machines or payload.pop("prefill_machines", []) or [])
+    remembered = list(payload.pop("prefill_machines", []) or [])
+    source = list(machines or remembered)
     payload.pop("pending_machine_count", None)
     payload["machine_count"] = count
     payload["items"] = []
@@ -1021,6 +1172,7 @@ async def _finish_machine_item(
     )
     payload["items"] = items
     payload.pop("current_machine", None)
+    payload.pop("pending_problem", None)
 
     count = int(payload.get("machine_count") or len(items))
     if len(items) < count:
@@ -1080,9 +1232,13 @@ async def _start_intake(msg: IncomingMessage, classified: dict) -> str:
     await set_state(msg.phone, "cust_machine_count", payload)
 
     if machines and machines[0].get("machine"):
-        machine_label = machines[0]["machine"]
+        machine_label = str(machines[0]["machine"]).strip()
+        if machine_label.lower().startswith("mesin "):
+            machine_phrase = f"*{machine_label}*"
+        else:
+            machine_phrase = f"mesin *{machine_label}*"
         return (
-            f"Baik, saya menangkap mesin *{machine_label}*. "
+            f"Baik, saya menangkap {machine_phrase}. "
             "Ada berapa unit mesin yang ingin dicek? "
             "Boleh jawab biasa seperti *satu*, *2 unit*, atau *mung siji*."
         )
@@ -1287,6 +1443,48 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         if count is None:
             count = analysis.get("machine_count")
 
+        problem_hint = _problem_from_count_reply(text, analysis)
+        extra_machines = list(analysis.get("machines") or [])
+        prefill = [
+            dict(item)
+            for item in list(payload.get("prefill_machines") or [])
+            if isinstance(item, dict)
+        ]
+        if extra_machines:
+            prefill = [
+                dict(item)
+                for item in extra_machines
+                if isinstance(item, dict)
+            ]
+
+        # A customer may answer the count and the symptom in one natural sentence,
+        # e.g. "Satu mas mesinnya sering loncatan". Merge that symptom into
+        # the already-known machine instead of asking for it again.
+        if problem_hint:
+            merged = False
+            for item in prefill:
+                machine = str(item.get("machine") or "").strip()
+                existing_problem = str(item.get("problem") or "").strip()
+                if machine and not existing_problem:
+                    item["problem"] = problem_hint
+                    merged = True
+                    break
+
+            if not merged:
+                fields = analysis.get("fields") or {}
+                machine = str(fields.get("machine_description") or "").strip()
+                if not machine and extra_machines:
+                    machine = str(extra_machines[0].get("machine") or "").strip()
+
+                if machine:
+                    prefill.insert(
+                        0,
+                        {"machine": machine[:300], "problem": problem_hint},
+                    )
+                else:
+                    # Keep the symptom until the machine description is supplied.
+                    payload["pending_problem"] = problem_hint
+
         if (
             _looks_like_price_question(text)
             or analysis.get("intent") == "PRICE_QUESTION"
@@ -1297,11 +1495,6 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             )
 
             if count is not None:
-                extra_machines = list(analysis.get("machines") or [])
-                prefill = list(payload.get("prefill_machines") or [])
-                if extra_machines:
-                    prefill = extra_machines
-
                 next_prompt = await _apply_machine_count(
                     msg.phone,
                     payload,
@@ -1316,17 +1509,33 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             )
 
         if count is not None:
-            extra_machines = list(analysis.get("machines") or [])
-            prefill = list(payload.get("prefill_machines") or [])
-            if extra_machines:
-                prefill = extra_machines
-
-            return await _apply_machine_count(
+            next_prompt = await _apply_machine_count(
                 msg.phone,
                 payload,
                 int(count),
                 prefill,
             )
+
+            # If the same message also contains a real side question, answer it
+            # after recording the count, then resume from the new intake state.
+            if not problem_hint:
+                if len(payload.get("items") or []) >= int(count):
+                    next_state = "cust_location"
+                elif payload.get("current_machine"):
+                    next_state = "cust_machine_problem"
+                else:
+                    next_state = "cust_machine_desc"
+
+                side = await _answer_side_question(
+                    msg,
+                    next_state,
+                    payload,
+                    analysis,
+                )
+                if side is not None:
+                    return side
+
+            return next_prompt
 
         side = await _answer_side_question(
             msg,
@@ -1355,6 +1564,10 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         if machines:
             machine = machine or str(machines[0].get("machine") or "").strip()
             problem = problem or str(machines[0].get("problem") or "").strip()
+
+        pending_problem = str(payload.get("pending_problem") or "").strip()
+        if machine and not problem and pending_problem:
+            problem = pending_problem
 
         if (
             _looks_like_price_question(text)
@@ -1525,6 +1738,20 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 payload,
                 current_machine,
                 problem,
+            )
+
+        # AI can occasionally classify a short symptom such as "sering loncat mas"
+        # as GENERAL_QUESTION. If the text itself is a declarative symptom, keep it
+        # as the complaint instead of sending it to free-form conversation.
+        if (
+            _looks_like_problem_statement(text)
+            and not _looks_like_question(text)
+        ):
+            return await _finish_machine_item(
+                msg.phone,
+                payload,
+                current_machine,
+                text[:1500],
             )
 
         side = await _answer_side_question(
