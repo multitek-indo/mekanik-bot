@@ -6,6 +6,15 @@ from .ai import (
     quick_customer_signals,
     understand_customer_message,
 )
+from .conversation import (
+    apply_corrections_to_payload as _v4_apply_corrections,
+    detect_side_topics as _v4_detect_side_topics,
+    explicit_correction_signal as _v4_correction_signal,
+    enrich_payload_memory as _v4_enrich_payload_memory,
+    friendly_resume_prompt as _v4_friendly_resume_prompt,
+    wants_service as _v4_wants_service,
+    compose_approved_reply as _v4_compose_approved_reply,
+)
 from .config import settings
 from .db import pool
 from .location import location_label, haversine_km
@@ -1172,50 +1181,23 @@ def _interruption_context_items(payload: dict) -> list[dict]:
 
 
 def _state_resume_prompt(state: str, payload: dict) -> str:
-    if state == "cust_name":
-        return "Kalau sudah jelas, boleh sebutkan nama Anda atau nama perusahaan?"
-
-    if state == "cust_machine_count":
-        return "Kalau lanjut, ada berapa unit mesin yang mau dicek?"
-
-    if state == "cust_machine_desc":
-        idx = int(payload.get("machine_index") or 1)
-        return f"Untuk lanjut, mesin ke-{idx} jenis/merk/modelnya apa?"
-
-    if state == "cust_machine_problem":
-        machine = str(payload.get("current_machine") or "mesin tersebut").strip()
-        return f"Kalau lanjut, apa keluhan pada *{machine}*? Ceritakan gejalanya saja—misalnya loncat, bunyi kasar, error, atau tidak jalan."
-
-    if state == "cust_location":
-        return "Kalau lanjut, kirim *Share Location* lokasi mesinnya ya supaya saya bisa mencari mekanik terdekat."
-
-    if state == "cust_location_confirm":
-        return "Kalau titik lokasi tadi sudah benar, jawab *iya* atau *betul*. Kalau salah, kirim Share Location ulang."
-
-    if state == "cust_media":
-        try:
-            item_no = int(payload.get("media_item_no") or 1)
-        except (TypeError, ValueError):
-            item_no = 1
-        machine = _media_machine_label(payload, item_no)
-        return (
-            f"Kalau ada, silakan lanjut kirim foto/video *{machine}*. "
-            "Kalau tidak ada, ketik *LEWATI*."
-        )
-
-    if state == "cust_landmark":
-        return "Kalau ada, sebutkan patokan lokasinya. Kalau tidak ada, cukup jawab *cukup* atau *tidak ada*."
-
-    if state == "cust_price_context":
-        return "Kalau mau lanjut servis, bilang saja *bantu perbaiki* atau ceritakan detail keluhannya."
-
-    if state == "cust_update_location":
-        return "Untuk melanjutkan perubahan lokasi, kirim *Share Location* yang baru."
-
-    return ""
+    # Conversation V4 treats state as "what data is still missing", not as a
+    # rigid menu. The prompt is therefore a gentle resume cue.
+    return _v4_friendly_resume_prompt(state, payload)
 
 
-def _side_question_topic(text: str) -> str | None:
+def _side_question_topics(text: str, analysis: dict | None = None) -> list[str]:
+    topics = _v4_detect_side_topics(text, analysis or {})
+    if topics:
+        return topics
+
+    # Legacy detector remains as a fallback for compatibility with old tests
+    # and phrases that are intentionally handled deterministically.
+    topic = _side_question_topic_legacy(text)
+    return [topic] if topic else []
+
+
+def _side_question_topic_legacy(text: str) -> str | None:
     low = _normalize_customer_text(text)
     if not low:
         return None
@@ -1413,6 +1395,13 @@ def _side_question_topic(text: str) -> str | None:
     return None
 
 
+def _side_question_topic(text: str) -> str | None:
+    topics = _v4_detect_side_topics(text, {})
+    if topics:
+        return topics[0]
+    return _side_question_topic_legacy(text)
+
+
 def _append_resume(answer: str, resume: str) -> str:
     answer = (answer or "").strip()
     resume = (resume or "").strip()
@@ -1434,10 +1423,10 @@ async def _common_question_answer(
     analysis = analysis or {}
     context_items = list(context_items or [])
 
-    if topic == "price" or analysis.get("intent") == "PRICE_QUESTION":
+    if topic == "price" or (topic is None and analysis.get("intent") == "PRICE_QUESTION"):
         return await price_answer(text, context_items)
 
-    if analysis.get("intent") == "STATUS_QUESTION":
+    if topic == "status" or (topic is None and analysis.get("intent") == "STATUS_QUESTION"):
         active = await active_order_for_customer(msg.phone)
         if active:
             return await customer_status_summary(active["order_no"])
@@ -1542,24 +1531,99 @@ async def _answer_side_question(
     context_items = list(context_items or _interruption_context_items(payload))
 
     if analysis.get("control") == "GREETING":
-        return _append_resume("Halo, silakan.", resume)
+        approved = "Halo, silakan."
+        if analysis.get("provider") not in {None, "local"}:
+            return await _v4_compose_approved_reply(
+                text, approved, resume, analysis, payload
+            )
+        return _append_resume(approved, resume)
 
-    topic = _side_question_topic(text)
-    if topic is None and analysis.get("intent") == "PRICE_QUESTION":
-        topic = "price"
-    if topic is None and analysis.get("intent") == "STATUS_QUESTION":
-        topic = "general"
+    topics = _side_question_topics(text, analysis)
+    if not topics and analysis.get("intent") == "PRICE_QUESTION":
+        topics = ["price"]
+    if not topics and analysis.get("intent") == "STATUS_QUESTION":
+        topics = ["status"]
 
-    answer = await _common_question_answer(
-        msg,
-        topic,
-        text,
-        context_items=context_items,
-        analysis=analysis,
-    )
-    if answer is None:
+    answers: list[str] = []
+    for topic in topics[:3]:
+        mapped = "general" if topic == "status" else topic
+        answer = await _common_question_answer(
+            msg,
+            mapped,
+            text,
+            context_items=context_items,
+            analysis=analysis,
+        )
+        if answer and answer not in answers:
+            answers.append(answer)
+
+    if not answers:
         return None
-    return _append_resume(answer, resume)
+
+    approved = "\n\n".join(answers)
+    # Real NLU responses carry a provider name. Unit tests often use a small
+    # fake analysis without provider; keep those deterministic and offline.
+    if analysis.get("provider") not in {None, "local"}:
+        return await _v4_compose_approved_reply(
+            text,
+            approved,
+            resume,
+            analysis,
+            payload,
+        )
+    return _append_resume(approved, resume)
+
+
+def _correction_ack(notes: list[str] | None) -> str:
+    notes = [str(x).strip() for x in (notes or []) if str(x).strip()]
+    if not notes:
+        return ""
+    if len(notes) == 1:
+        return f"Siap, saya koreksi: {notes[0]}."
+    return "Siap, koreksinya sudah saya catat: " + "; ".join(notes[:3]) + "."
+
+
+async def _reconcile_after_correction(
+    phone: str,
+    current_state: str,
+    payload: dict,
+    notes: list[str] | None,
+) -> tuple[str, str]:
+    """Return the correct next state after an explicit customer correction.
+
+    A correction may invalidate a later step. Example: while waiting for
+    location, customer changes quantity from 1 to 2. We must collect machine
+    #2 before asking for location again.
+    """
+    ack = _correction_ack(notes)
+    if not ack:
+        return current_state, ""
+
+    post_machine_states = {
+        "cust_location",
+        "cust_location_confirm",
+        "cust_media",
+        "cust_landmark",
+    }
+    if current_state in post_machine_states:
+        try:
+            count = int(payload.get("machine_count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        items = [x for x in list(payload.get("items") or []) if isinstance(x, dict)]
+        if count and len(items) < count:
+            idx = len(items) + 1
+            payload["machine_index"] = idx
+            payload.pop("current_machine", None)
+            await set_state(phone, "cust_machine_desc", payload)
+            prompt = (
+                f"Karena jumlahnya sekarang {count} unit, saya masih perlu data mesin ke-{idx}. "
+                "Merek, jenis, atau modelnya apa?"
+            )
+            return "cust_machine_desc", ack + "\n\n" + prompt
+
+    prompt = _state_resume_prompt(current_state, payload)
+    return current_state, _append_resume(ack, prompt)
 
 
 async def _apply_machine_count(
@@ -1765,12 +1829,21 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             ai_cache = await understand_customer_message(
                 text,
                 state=st,
-                context=payload,
+                context=_v4_enrich_payload_memory(payload, st),
             )
         return ai_cache
 
+    async def apply_explicit_corrections(analysis: dict | None) -> list[str]:
+        nonlocal payload
+        updated, notes = _v4_apply_corrections(payload, analysis or {}, text)
+        if notes and updated != payload:
+            payload = updated
+            await set_state(msg.phone, st, payload)
+        return notes
+
     if st == "cust_price_context":
         analysis = await understand()
+        correction_notes = await apply_explicit_corrections(analysis)
         low = _normalize_customer_text(text)
 
         # A customer who has just asked about price may naturally say things
@@ -1780,6 +1853,7 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         wants_service = (
             analysis.get("intent") == "SERVICE_REQUEST"
             or _looks_like_service_request(text)
+            or _v4_wants_service(text, analysis)
         )
 
         remembered = [
@@ -1855,9 +1929,14 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             await clear_state(msg.phone)
             next_reply = await _start_intake(msg, classified)
 
+            correction_prefix = _correction_ack(correction_notes)
             if wants_service:
-                return "Bisa, saya bantu proses servicenya.\n\n" + next_reply
-            return "Baik, keluhannya saya catat. Saya bantu lanjutkan proses servicenya.\n\n" + next_reply
+                prefix = "Bisa, saya bantu proses servicenya."
+            else:
+                prefix = "Baik, keluhannya saya catat. Saya bantu lanjutkan proses servicenya."
+            if correction_prefix:
+                prefix = correction_prefix + "\n\n" + prefix
+            return prefix + "\n\n" + next_reply
 
         if (
             _looks_like_price_question(text)
@@ -1868,10 +1947,16 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 payload["prefill_machines"] = machines
                 await set_state(msg.phone, "cust_price_context", payload)
 
-            return await price_answer(
-                text,
-                _context_items_from_payload(payload),
+            side = await _answer_side_question(
+                msg,
+                "cust_price_context",
+                payload,
+                analysis,
+                context_items=_context_items_from_payload(payload),
             )
+            if side is not None:
+                return side
+            return await price_answer(text, _context_items_from_payload(payload))
 
         if analysis.get("control") == "GREETING":
             return (
@@ -1902,6 +1987,7 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
     if st == "cust_name":
         analysis = await understand() if text else {}
+        correction_notes = await apply_explicit_corrections(analysis) if text else []
 
         if quick.get("control") == "GREETING" or analysis.get("control") == "GREETING":
             return (
@@ -1990,8 +2076,11 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         count = quick.get("machine_count")
         analysis = await understand() if text else {}
+        correction_notes = await apply_explicit_corrections(analysis) if text else []
         if count is None:
             count = analysis.get("machine_count")
+        if count is None and payload.get("pending_machine_count"):
+            count = payload.get("pending_machine_count")
 
         problem_hint = _problem_from_count_reply(text, analysis)
         extra_machines = list(analysis.get("machines") or [])
@@ -2058,11 +2147,6 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             _looks_like_price_question(text)
             or analysis.get("intent") == "PRICE_QUESTION"
         ):
-            answer = await price_answer(
-                text,
-                _context_items_from_payload(payload),
-            )
-
             if count is not None:
                 next_prompt = await _apply_machine_count(
                     msg.phone,
@@ -2070,12 +2154,25 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                     int(count),
                     prefill,
                 )
-                return _append_resume(answer, next_prompt)
+                if len(payload.get("items") or []) >= int(count):
+                    next_state = "cust_location"
+                elif payload.get("current_machine"):
+                    next_state = "cust_machine_problem"
+                else:
+                    next_state = "cust_machine_desc"
+                side = await _answer_side_question(
+                    msg, next_state, payload, analysis,
+                    context_items=_context_items_from_payload(payload),
+                )
+                return side or next_prompt
 
-            return _append_resume(
-                answer,
-                "Untuk melanjutkan pencarian mekanik, ada berapa mesin yang ingin dicek?",
+            side = await _answer_side_question(
+                msg, st, payload, analysis,
+                context_items=_context_items_from_payload(payload),
             )
+            if side is not None:
+                return side
+            return _state_resume_prompt(st, payload)
 
         if count is not None:
             next_prompt = await _apply_machine_count(
@@ -2131,6 +2228,7 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             return "Sebutkan yang Anda tahu tentang mesinnya, misalnya merek, jenis, atau model."
 
         analysis = await understand()
+        correction_notes = await apply_explicit_corrections(analysis)
         fields = analysis.get("fields") or {}
         machines = analysis.get("machines") or []
         machine = str(fields.get("machine_description") or "").strip()
@@ -2152,27 +2250,30 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             if machine or problem:
                 price_context.append({"machine": machine, "problem": problem})
 
-            answer = await price_answer(text, price_context)
-
             if machine and problem:
                 next_prompt = await _finish_machine_item(
-                    msg.phone,
-                    payload,
-                    machine,
-                    problem,
+                    msg.phone, payload, machine, problem
                 )
-                return _append_resume(answer, next_prompt)
+                count = int(payload.get("machine_count") or len(payload.get("items") or []))
+                next_state = "cust_location" if len(payload.get("items") or []) >= count else "cust_machine_desc"
+                side = await _answer_side_question(
+                    msg, next_state, payload, analysis, context_items=price_context
+                )
+                return side or next_prompt
 
             if machine:
                 payload["current_machine"] = machine[:300]
                 await set_state(msg.phone, "cust_machine_problem", payload)
                 next_prompt = f"Saya juga catat mesinnya *{machine}*. Keluhannya bagaimana?"
-                return _append_resume(answer, next_prompt)
+                side = await _answer_side_question(
+                    msg, "cust_machine_problem", payload, analysis, context_items=price_context
+                )
+                return side or next_prompt
 
-            return _append_resume(
-                answer,
-                _state_resume_prompt(st, payload),
+            side = await _answer_side_question(
+                msg, st, payload, analysis, context_items=price_context
             )
+            return side or _state_resume_prompt(st, payload)
 
         if analysis.get("control") == "GREETING":
             return "Halo. Kita lanjut ya. Mesin yang bermasalah jenis/merk/modelnya apa?"
@@ -2277,6 +2378,7 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             )
 
         analysis = await understand()
+        correction_notes = await apply_explicit_corrections(analysis)
         fields = analysis.get("fields") or {}
         machines = analysis.get("machines") or []
         problem = str(fields.get("problem") or "").strip()
@@ -2293,28 +2395,26 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             price_context = _interruption_context_items(payload)
             if current_machine and problem:
                 price_context = [
-                    item
-                    for item in price_context
-                    if str(item.get("machine") or "").strip().lower()
-                    != current_machine.lower()
+                    item for item in price_context
+                    if str(item.get("machine") or "").strip().lower() != current_machine.lower()
                 ]
                 price_context.append({"machine": current_machine, "problem": problem})
 
-            answer = await price_answer(text, price_context)
-
             if problem:
                 next_prompt = await _finish_machine_item(
-                    msg.phone,
-                    payload,
-                    current_machine,
-                    problem,
+                    msg.phone, payload, current_machine, problem
                 )
-                return _append_resume(answer, next_prompt)
+                count = int(payload.get("machine_count") or len(payload.get("items") or []))
+                next_state = "cust_location" if len(payload.get("items") or []) >= count else "cust_machine_desc"
+                side = await _answer_side_question(
+                    msg, next_state, payload, analysis, context_items=price_context
+                )
+                return side or next_prompt
 
-            return _append_resume(
-                answer,
-                _state_resume_prompt(st, payload),
+            side = await _answer_side_question(
+                msg, st, payload, analysis, context_items=price_context
             )
+            return side or _state_resume_prompt(st, payload)
 
         if analysis.get("control") == "GREETING":
             return (
@@ -2401,6 +2501,18 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
     if st == "cust_location":
         if not msg.location:
             analysis = await understand() if text else {}
+            correction_notes = await apply_explicit_corrections(analysis) if text else []
+            if correction_notes:
+                corrected_state, correction_reply = await _reconcile_after_correction(
+                    msg.phone, st, payload, correction_notes
+                )
+                side = await _answer_side_question(
+                    msg, corrected_state, payload, analysis
+                )
+                if side is not None:
+                    return _correction_ack(correction_notes) + "\n\n" + side
+                return correction_reply
+
             side = await _answer_side_question(
                 msg,
                 st,
@@ -2437,39 +2549,36 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         control = quick.get("control")
         analysis = None
-        if control not in {"YES", "NO"} and text:
+        if text and _v4_correction_signal(text):
             analysis = await understand()
+            correction_notes = await apply_explicit_corrections(analysis)
+            if correction_notes:
+                corrected_state, correction_reply = await _reconcile_after_correction(
+                    msg.phone, st, payload, correction_notes
+                )
+                if corrected_state != st:
+                    return correction_reply
+        if control not in {"YES", "NO"} and text:
+            if analysis is None:
+                analysis = await understand()
             control = analysis.get("control")
 
         if control == "YES":
             next_prompt = await _begin_customer_media(msg.phone, payload)
-            topic = _side_question_topic(text)
-            if topic not in {None, "general"}:
-                answer = await _common_question_answer(
-                    msg,
-                    topic,
-                    text,
-                    context_items=_interruption_context_items(payload),
-                    analysis=analysis or {},
-                )
-                if answer:
-                    return _append_resume(answer, next_prompt)
-            return next_prompt
+            next_state = "cust_media" if payload.get("media_item_no") else "cust_landmark"
+            side = await _answer_side_question(
+                msg, next_state, payload, analysis or {},
+                context_items=_interruption_context_items(payload),
+            )
+            return side or next_prompt
 
         if control == "NO":
             next_prompt = "Baik, berarti titik tadi belum benar. Silakan kirim *Share Location* yang benar."
-            topic = _side_question_topic(text)
-            if topic not in {None, "general"}:
-                answer = await _common_question_answer(
-                    msg,
-                    topic,
-                    text,
-                    context_items=_interruption_context_items(payload),
-                    analysis=analysis or {},
-                )
-                if answer:
-                    return _append_resume(answer, next_prompt)
-            return next_prompt
+            side = await _answer_side_question(
+                msg, "cust_location", payload, analysis or {},
+                context_items=_interruption_context_items(payload),
+            )
+            return side or next_prompt
 
         if text:
             if analysis is None:
@@ -2558,6 +2667,21 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 "Kalau tidak ada, ketik *LEWATI*."
             )
 
+        analysis = await understand() if text else {}
+        correction_notes = await apply_explicit_corrections(analysis) if text and _v4_correction_signal(text, analysis) else []
+        if correction_notes and not _media_finish_requested(text):
+            corrected_state, correction_reply = await _reconcile_after_correction(
+                msg.phone, st, payload, correction_notes
+            )
+            if corrected_state != st:
+                return correction_reply
+            side = await _answer_side_question(
+                msg, corrected_state, payload, analysis, context_items=items
+            )
+            if side is not None:
+                return _correction_ack(correction_notes) + "\n\n" + side
+            return correction_reply
+
         low = _normalize_customer_text(text)
         finished = {
             "selesai",
@@ -2585,21 +2709,12 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         if low in finished or _media_finish_requested(text):
             next_prompt = await _advance_customer_media(msg.phone, payload)
-            analysis = await understand() if text else {}
-            topic = _side_question_topic(text)
-            if topic not in {None, "general"}:
-                answer = await _common_question_answer(
-                    msg,
-                    topic,
-                    text,
-                    context_items=items,
-                    analysis=analysis,
-                )
-                if answer:
-                    return _append_resume(answer, next_prompt)
-            return next_prompt
+            next_state = "cust_media" if payload.get("media_item_no") else "cust_landmark"
+            side = await _answer_side_question(
+                msg, next_state, payload, analysis, context_items=items
+            )
+            return side or next_prompt
 
-        analysis = await understand() if text else {}
         side = await _answer_side_question(
             msg,
             st,
@@ -2653,6 +2768,13 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         )
 
         analysis = await understand() if text else {}
+        correction_notes = await apply_explicit_corrections(analysis) if text and _v4_correction_signal(text, analysis) else []
+        if correction_notes:
+            corrected_state, correction_reply = await _reconcile_after_correction(
+                msg.phone, st, payload, correction_notes
+            )
+            if corrected_state != st:
+                return correction_reply
         landmark_from_ai = str((analysis.get("fields") or {}).get("landmark") or "").strip()
         landmark_fallback = _landmark_from_text_fallback(text)
         strong_topic = _side_question_topic(text)
@@ -2854,7 +2976,7 @@ def _simple_greeting_reply(text: str) -> str | None:
     }
 
     if up in exact:
-        return "Ya. Ada yang bisa saya bantu terkait mesin atau kebutuhan teknisi?"
+        return "Halo. Silakan, ada yang bisa saya bantu soal mesin atau kebutuhan teknisi?"
 
     time_greetings = {
         "SUGENG ENJING": "Sugeng enjing.",
@@ -2880,7 +3002,7 @@ def _simple_greeting_reply(text: str) -> str | None:
     if up in time_greetings:
         return (
             time_greetings[up]
-            + " Ada yang bisa saya bantu terkait mesin atau kebutuhan teknisi?"
+            + " Silakan, ada yang bisa saya bantu soal mesin atau kebutuhan teknisi?"
         )
 
     return None
@@ -2935,12 +3057,14 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
             context_items = await _order_context_items(active["id"])
 
         answer = await price_answer(text, context_items)
+        resume = ""
         if not active:
-            return (
-                answer
-                + "\n\nKalau mau, saya bisa langsung bantu proses servicenya dan carikan mekanik yang sesuai."
+            resume = "Kalau mau, saya bisa langsung bantu proses servicenya dan carikan mekanik yang sesuai."
+        if classified.get("provider") not in {None, "local"}:
+            return await _v4_compose_approved_reply(
+                text, answer, resume, classified, {"prefill_machines": context_items}
             )
-        return answer
+        return _append_resume(answer, resume) if resume else answer
 
     if classified.get("intent") == "STATUS_QUESTION":
         if active:
@@ -2953,20 +3077,29 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
     if (
         classified.get("intent") == "SERVICE_REQUEST"
         or _looks_like_service_request(text)
+        or _v4_wants_service(text, classified)
     ):
         return await _start_intake(msg, classified)
 
-    # Answer common off-flow questions directly even when no intake state exists.
-    topic = _side_question_topic(text)
-    common = await _common_question_answer(
-        msg,
-        topic,
-        text,
-        context_items=(await _order_context_items(active["id"]) if active else []),
-        analysis=classified,
-    )
-    if common is not None:
-        return common
+    # Answer one or several off-flow questions naturally even when no intake
+    # state exists. Business facts still come from deterministic handlers.
+    topics = _side_question_topics(text, classified)
+    if topics:
+        context_items = await _order_context_items(active["id"]) if active else []
+        answers = []
+        for topic in topics[:3]:
+            common = await _common_question_answer(
+                msg, topic, text, context_items=context_items, analysis=classified
+            )
+            if common and common not in answers:
+                answers.append(common)
+        if answers:
+            approved = "\n\n".join(answers)
+            if classified.get("provider") not in {None, "local"}:
+                return await _v4_compose_approved_reply(
+                    text, approved, "", classified, {}
+                )
+            return approved
 
     return await conversational_customer_reply(text)
 
