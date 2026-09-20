@@ -271,3 +271,111 @@ def test_warranty_question_during_media_is_answered_and_media_flow_remains(monke
     assert "garansi" in reply.lower()
     assert "foto/video" in reply.lower()
     assert "Juki jarum 1" in reply
+
+
+def test_count_plus_problem_in_one_message_is_not_lost(monkeypatch):
+    payload = {
+        "customer_id": "customer-id",
+        "items": [],
+        "prefill_machines": [
+            {"machine": "mesin jahit", "problem": ""}
+        ],
+    }
+    saved = {}
+
+    async def fake_get_state(phone):
+        return {"state": "cust_machine_count", "payload": payload}
+
+    async def fake_understand(text, state="", context=None):
+        return {
+            "intent": "GENERAL_QUESTION",
+            "control": "NONE",
+            "machine_count": 1,
+            "machines": [],
+            "fields": {
+                "name": None,
+                "machine_description": None,
+                "problem": None,
+                "landmark": None,
+            },
+            "normalized_text": text,
+            "requires_clarification": False,
+        }
+
+    async def fake_set_state(phone, state, new_payload):
+        saved["state"] = state
+        saved["payload"] = dict(new_payload)
+
+    monkeypatch.setattr(customer, "get_state", fake_get_state)
+    monkeypatch.setattr(customer, "understand_customer_message", fake_understand)
+    monkeypatch.setattr(
+        customer,
+        "quick_customer_signals",
+        lambda text, state="": {"control": "NONE", "machine_count": 1},
+    )
+    monkeypatch.setattr(customer, "set_state", fake_set_state)
+
+    reply = asyncio.run(
+        customer.handle_customer_state(
+            _msg("Satu mas mesinnya sering loncatan")
+        )
+    )
+
+    assert saved["state"] == "cust_location"
+    assert saved["payload"]["items"][0]["machine"] == "mesin jahit"
+    assert saved["payload"]["items"][0]["problem"] == "sering loncatan"
+    assert "share location" in reply.lower()
+
+
+def test_short_problem_statement_is_not_sent_to_general_chat(monkeypatch):
+    payload = {
+        "customer_id": "customer-id",
+        "machine_count": 1,
+        "machine_index": 1,
+        "items": [],
+        "current_machine": "mesin jahit",
+    }
+    captured = {}
+
+    async def fake_get_state(phone):
+        return {"state": "cust_machine_problem", "payload": payload}
+
+    async def fake_understand(text, state="", context=None):
+        return {
+            "intent": "GENERAL_QUESTION",
+            "control": "NONE",
+            "machine_count": None,
+            "machines": [],
+            "fields": {
+                "name": None,
+                "machine_description": None,
+                "problem": None,
+                "landmark": None,
+            },
+            "normalized_text": text,
+            "requires_clarification": False,
+        }
+
+    async def fake_finish(phone, state_payload, machine, problem):
+        captured["machine"] = machine
+        captured["problem"] = problem
+        return "NEXT"
+
+    monkeypatch.setattr(customer, "get_state", fake_get_state)
+    monkeypatch.setattr(customer, "understand_customer_message", fake_understand)
+    monkeypatch.setattr(
+        customer,
+        "quick_customer_signals",
+        lambda text, state="": {"control": "NONE", "machine_count": None},
+    )
+    monkeypatch.setattr(customer, "_finish_machine_item", fake_finish)
+
+    reply = asyncio.run(
+        customer.handle_customer_state(
+            _msg("Sering loncat mas")
+        )
+    )
+
+    assert reply == "NEXT"
+    assert captured["machine"] == "mesin jahit"
+    assert captured["problem"] == "Sering loncat mas"
