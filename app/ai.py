@@ -113,6 +113,21 @@ berbicara tidak berurutan, memberi beberapa informasi sekaligus, bertanya di
 tengah alur, mengoreksi data lama, memakai typo, singkatan, Bahasa Indonesia,
 Jawa ngoko, Jawa krama, atau campuran Jawa-Indonesia.
 
+ATURAN PEMAHAMAN V5:
+- Ekstrak SEMUA fakta yang customer berikan pada turn ini, bukan hanya field
+  yang sedang ditanyakan backend. Jika satu pesan berisi mesin + keluhan +
+  pertanyaan jadwal, ketiganya harus keluar di JSON.
+- Jangan meminta customer mengulang fakta yang sudah jelas di pesan atau
+  known_context.
+- Jika current_state=cust_machine_desc, jawaban satu kata seperti "Juki",
+  "Pegasus", "Brother", "obras", atau "jarum 1" adalah jawaban mesin yang valid.
+- Jika customer menulis "Juki jarum 1 sering loncat kalau buat jahit", keluarkan
+  machine_description="Juki jarum 1" DAN problem="sering loncat kalau buat jahit".
+- Jika current_state=cust_machine_problem, kalimat pendek seperti "sering loncat
+  mas", "pedale ra respon", "benange pedot", "mati total" adalah jawaban keluhan.
+- State adalah petunjuk data yang masih kurang, BUKAN batasan topik percakapan.
+- Pertanyaan sampingan boleh dijawab tanpa menghapus fakta service yang sudah ada.
+
 Contoh yang harus dipahami:
 - "sy butuh teknsi" -> meminta teknisi.
 - "msin jhkit juki srng lonct" -> mesin jahit Juki, keluhan sering loncat.
@@ -864,6 +879,130 @@ def _safe_context(context: dict | None) -> dict:
     return safe
 
 
+async def _targeted_slot_repair(
+    text: str,
+    state: str,
+    context: dict | None,
+    base: dict,
+) -> dict:
+    """Focused semantic repair when the broad NLU missed the slot we need.
+
+    A general multi-intent parser can occasionally understand the symptom but
+    omit a simple brand such as "Juki".  Instead of asking the customer to
+    repeat themselves, this second pass asks one narrow question about the
+    currently missing slot.  Business facts are still protected by _fact_guard.
+    """
+    if state not in {
+        "cust_name",
+        "cust_machine_count",
+        "cust_machine_desc",
+        "cust_machine_problem",
+        "cust_landmark",
+    }:
+        return base
+
+    expectation = STATE_EXPECTATION.get(state, "informasi yang sedang dibutuhkan")
+    packet = {
+        "current_state": state,
+        "backend_waiting_for": expectation,
+        "customer_message": (text or "")[:3000],
+        "known_context": _safe_context(context),
+        "first_pass": {
+            "machine_count": base.get("machine_count"),
+            "machines": base.get("machines") or [],
+            "fields": base.get("fields") or {},
+            "questions": base.get("questions") or [],
+            "speech_acts": base.get("speech_acts") or [],
+        },
+    }
+    system = r"""
+Anda adalah pemeriksa kedua untuk percakapan customer service mesin garment.
+Fokus HANYA pada fakta yang benar-benar tertulis dalam pesan customer dan slot
+backend yang sedang dibutuhkan. Jangan menebak fakta yang tidak ada.
+
+Sangat penting:
+- Jika backend menunggu jenis/merek/model mesin, "Juki" SAJA sudah merupakan
+  jawaban mesin yang valid.
+- "Juki jarum 1 sering loncat kalau buat jahit" berarti mesin = "Juki jarum 1"
+  dan problem = "sering loncat kalau buat jahit".
+- "obras Pegasus suaranya kasar" berarti mesin = "obras Pegasus" dan problem =
+  "suaranya kasar".
+- Jika backend menunggu keluhan, kalimat singkat seperti "sering loncat mas",
+  "pedale ra respon", atau "benange pedot" adalah jawaban keluhan.
+- Jangan menganggap pertanyaan sampingan sebagai jawaban slot.
+- Jangan membuat machine_count=1 hanya karena satu mesin disebut; jumlah harus
+  disebut eksplisit.
+- Pertahankan merek/model persis sejauh mungkin dan pahami typo serta Jawa.
+
+Kembalikan JSON valid saja:
+{
+  "answers_current_slot": true|false,
+  "machine_count": integer|null,
+  "machine_description": string|null,
+  "problem": string|null,
+  "name": string|null,
+  "landmark": string|null,
+  "confidence": 0.0
+}
+"""
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(packet, ensure_ascii=False)},
+    ]
+
+    for provider in _provider_order():
+        content = await _chat(provider, messages, 0.0, 500)
+        if not content:
+            continue
+        parsed = _extract_json(content)
+        if not parsed:
+            continue
+
+        repaired = dict(base)
+        fields = dict(repaired.get("fields") or {})
+        machine = str(parsed.get("machine_description") or "").strip()
+        problem = str(parsed.get("problem") or "").strip()
+        name = str(parsed.get("name") or "").strip()
+        landmark = str(parsed.get("landmark") or "").strip()
+
+        if machine and not fields.get("machine_description"):
+            fields["machine_description"] = machine[:300]
+        if problem and not fields.get("problem"):
+            fields["problem"] = problem[:1500]
+        if name and not fields.get("name"):
+            fields["name"] = name[:150]
+        if landmark and not fields.get("landmark"):
+            fields["landmark"] = landmark[:500]
+        repaired["fields"] = fields
+
+        machines = [dict(x) for x in repaired.get("machines") or [] if isinstance(x, dict)]
+        if machine or problem:
+            if machines:
+                if machine and not str(machines[0].get("machine") or "").strip():
+                    machines[0]["machine"] = machine[:300]
+                if problem and not str(machines[0].get("problem") or "").strip():
+                    machines[0]["problem"] = problem[:1500]
+            else:
+                machines = [{"machine": machine[:300], "problem": problem[:1500]}]
+        repaired["machines"] = machines
+
+        explicit = _explicit_machine_count_evidence(text, state)
+        if explicit is not None:
+            repaired["machine_count"] = explicit
+
+        if parsed.get("answers_current_slot"):
+            repaired["answers_current_slot"] = True
+        repaired["confidence"] = max(
+            float(repaired.get("confidence") or 0.0),
+            float(parsed.get("confidence") or 0.0),
+        )
+        repaired["provider"] = f"{repaired.get('provider', 'unknown')}+slot-repair:{provider}"
+        repaired["slot_repair_used"] = True
+        return repaired
+
+    return base
+
+
 async def understand_customer_message(
     text: str,
     state: str = "",
@@ -917,14 +1056,20 @@ async def understand_customer_message(
 
     if not results:
         return local
+
     if len(results) == 1:
         result = results[0]
         result["fallback_used"] = bool(providers and result["provider"] != providers[0])
-        result["requires_clarification"] = bool(result.get("ambiguity") or _missing(result, state))
-        return result
+    else:
+        result = _merge(results[0], results[1], local)
+        result = _fact_guard(text, state, context, result, local)
 
-    merged = _merge(results[0], results[1], local)
-    return _fact_guard(text, state, context, merged, local)
+    if _missing(result, state):
+        result = await _targeted_slot_repair(text, state, context, result)
+        result = _fact_guard(text, state, context, result, local)
+
+    result["requires_clarification"] = bool(result.get("ambiguity") or _missing(result, state))
+    return result
 
 
 async def classify_customer_message(text: str) -> dict:
