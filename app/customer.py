@@ -185,7 +185,8 @@ def _normalize_customer_text(text: str) -> str:
         (r"\bning\s+endi\b", "mana"),
         (r"\bsaking\s+pundi\b", "dari mana"),
         (r"\bkados\s+pundi\b", "bagaimana"),
-        (r"\bpunyamesin\b", "punya mesin"),
+        (r"\bpunya\s*mes[ni]+\b", "punya mesin"),
+        (r"\bpunyames[ni]+\b", "punya mesin"),
         (r"\bmesinjahit\b", "mesin jahit"),
         (r"\bgakjalan\b", "gak jalan"),
         (r"\bgajalan\b", "ga jalan"),
@@ -479,6 +480,153 @@ def _analysis_problem(analysis: dict | None) -> str:
             return problem[:1500]
 
     return ""
+
+
+def _strip_chat_fillers(value: str) -> str:
+    """Remove conversational wrappers without changing the customer's core fact."""
+    value = re.sub(r"\s+", " ", (value or "")).strip(" ,.;:-")
+    if not value:
+        return ""
+
+    # Natural introductions frequently used before a machine description.
+    value = re.sub(
+        r"(?i)^\s*(?:"
+        r"(?:aku|saya|sy|kula)\s+(?:punya|nduwe|gadhah|gadah)\s+"
+        r"|(?:aku|saya|sy|kula)\s+"
+        r"|punya\s+"
+        r")?"
+        r"(?:mesin|msin|mesn|mesine|mesinku|mesinnya|mesin\s+j[a-z]*h?i?t)?\s*",
+        "",
+        value,
+        count=1,
+    ).strip(" ,.;:-")
+
+    value = re.sub(
+        r"(?i)[\s,.;:-]*(?:mas|min|pak|bu|mbak|mba|gan|nggih|ya)$",
+        "",
+        value,
+        count=1,
+    ).strip(" ,.;:-")
+    return value
+
+
+def _problem_start_match(text: str):
+    """Find the first strong symptom phrase in a free-form machine sentence.
+
+    This is a safety net when an LLM understands the symptom but misses the
+    machine, or vice versa.  It intentionally looks for strong fault language
+    rather than trying to enumerate every machine brand/model.
+    """
+    if not text:
+        return None
+    pattern = re.compile(
+        r"(?i)\b(?:"
+        r"rusak|error|eror|mati(?:\s+total)?|macet|ngadat|seret|panas|ngebul|bocor|"
+        r"sering\s+(?:loncat|lompat|putus|pedot|error|macet|skip)|"
+        r"(?:jahitan|jahitannya|jahitane)\s+(?:sering\s+)?(?:loncat|lompat|skip|jelek|ora\s+rapi|tidak\s+rapi)|"
+        r"(?:benang|benangnya|benange)\s+(?:sering\s+)?(?:putus|pedot|kusut|kendor|kencang)|"
+        r"(?:suara|suaranya|suarane|bunyi)\s+(?:kasar|keras|aneh|berisik)|"
+        r"(?:pedal|pedalnya|pedale)\s+(?:tidak|ga|gak|nggak|ngga|ora|ra)\s+(?:respon|merespon|jalan|mlaku)|"
+        r"(?:tidak|ga|gak|nggak|ngga|ora|ra)\s+(?:(?:mau|gelem)\s+)?(?:jalan|mlaku|nyala|muter|menjahit|njahit|respon|merespon)|"
+        r"loncat|lompat|skip\s*stitch|putus|pedot|patah|getar|geter|berisik|kasar"
+        r")\b"
+    )
+    return pattern.search(text)
+
+
+def _local_machine_problem_fallback(
+    text: str,
+    *,
+    expected_machine: bool = False,
+    expected_problem: bool = False,
+    pending_problem: str = "",
+) -> dict:
+    """Recover machine/problem facts from ordinary WhatsApp language.
+
+    The LLM remains primary.  This deterministic fallback exists so simple
+    messages such as "Juki" or "Juki jarum 1 sering loncat" never become
+    unproductive loops merely because one model turn missed a slot.
+    """
+    raw = re.sub(r"\s+", " ", (text or "")).strip()
+    if not raw:
+        return {"machine": "", "problem": ""}
+
+    # Do not reinterpret an actual side question as machine data.
+    topics = _side_question_topics(raw, {})
+    if topics and not _looks_like_problem_statement(raw):
+        return {"machine": "", "problem": ""}
+
+    cleaned = raw
+    # Repair a few concatenated WhatsApp forms before splitting.  Semantic AI
+    # still handles unseen typos; these are only high-frequency local guards.
+    cleaned = re.sub(r"(?i)\bpunya\s*mes[ni]+\b", "punya mesin", cleaned)
+    cleaned = re.sub(r"(?i)\bpunyames[ni]+\b", "punya mesin", cleaned)
+    cleaned = re.sub(r"(?i)\bmes[ni]+\s*j(?:a|h)?h?i?t\b", "mesin jahit", cleaned)
+
+    match = _problem_start_match(cleaned)
+    machine = ""
+    problem = ""
+
+    if match:
+        left = cleaned[: match.start()].strip(" ,.;:-")
+        right = cleaned[match.start() :].strip(" ,.;:-")
+        machine = _strip_chat_fillers(left)
+        problem = right
+
+        # Avoid generic leftovers such as only "mesin".
+        if machine.lower() in {"", "mesin", "mesin jahit", "mesinnya", "mesinku"}:
+            machine = ""
+    elif expected_problem and _looks_like_problem_statement(cleaned):
+        problem = _clean_problem_fragment(cleaned) or cleaned
+    elif expected_machine:
+        candidate = _strip_chat_fillers(cleaned)
+        low = _normalize_customer_text(candidate)
+        reject = {
+            "iya", "ya", "oke", "ok", "siap", "baik", "nggih", "nanti", "sebentar",
+            "sudah", "belum", "lanjut", "makasih", "terima kasih", "matur nuwun",
+        }
+        machine_shape = bool(
+            re.search(
+                r"(?i)\b(?:jarum\s*\d+|obras|overdeck|kansai|bartack|walking\s*foot|zigzag|"
+                r"auto\s*(?:cutter|template|spreading)|servo)\b",
+                candidate,
+            )
+        )
+        if (
+            candidate
+            and 1 <= len(candidate.split()) <= 10
+            and low not in reject
+            and not _looks_like_question(candidate)
+            and (not _looks_like_problem_statement(candidate) or machine_shape)
+        ):
+            machine = candidate[:300]
+
+    if machine and not problem and pending_problem:
+        problem = pending_problem[:1500]
+
+    return {
+        "machine": machine[:300],
+        "problem": problem[:1500],
+    }
+
+
+def _merge_machine_facts(primary: list[dict], fallback: dict) -> list[dict]:
+    """Merge a local recovery result without overwriting stronger AI facts."""
+    items = [dict(x) for x in (primary or []) if isinstance(x, dict)]
+    machine = str(fallback.get("machine") or "").strip()
+    problem = str(fallback.get("problem") or "").strip()
+    if not machine and not problem:
+        return items
+
+    if not items:
+        return [{"machine": machine, "problem": problem}]
+
+    first = items[0]
+    if machine and not str(first.get("machine") or "").strip():
+        first["machine"] = machine
+    if problem and not str(first.get("problem") or "").strip():
+        first["problem"] = problem
+    return items
 
 
 def _clean_problem_fragment(text: str) -> str:
@@ -1734,6 +1882,15 @@ async def _finish_machine_item(
 async def _start_intake(msg: IncomingMessage, classified: dict) -> str:
     customer = await get_or_create_customer(msg.phone, msg.sender_name or None)
     machines = list(classified.get("machines") or [])[: settings.max_machines_per_order]
+
+    # V5 semantic recovery: a service request can contain machine + symptom in
+    # one informal sentence even when the general NLU only extracts one half.
+    # Example: "aku punyamesn Juki jarum 1 rusak sering loncat".
+    local_facts = _local_machine_problem_fallback(
+        msg.text or "",
+        expected_machine=True,
+    )
+    machines = _merge_machine_facts(machines, local_facts)[: settings.max_machines_per_order]
     machine_count = classified.get("machine_count")
 
     payload = {
@@ -1780,15 +1937,13 @@ async def _start_intake(msg: IncomingMessage, classified: dict) -> str:
 
         if problem_label:
             return (
-                f"Baik, saya sudah catat {machine_phrase} dengan keluhan "
-                f"*{problem_label}*. Ada berapa unit mesin yang ingin dicek? "
-                "Boleh jawab biasa seperti *satu*, *2 unit*, atau *mung siji*."
+                f"Siap, saya catat {machine_phrase} dengan keluhan *{problem_label}*. "
+                "Ini satu unit saja ya, atau ada mesin lain yang juga mau dicek?"
             )
 
         return (
-            f"Baik, saya menangkap {machine_phrase}. "
-            "Ada berapa unit mesin yang ingin dicek? "
-            "Boleh jawab biasa seperti *satu*, *2 unit*, atau *mung siji*."
+            f"Siap, saya catat {machine_phrase}. "
+            "Ini satu unit saja ya, atau ada mesin lain yang juga mau dicek?"
         )
 
     return (
@@ -2239,6 +2394,19 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             problem = problem or str(machines[0].get("problem") or "").strip()
 
         pending_problem = str(payload.get("pending_problem") or "").strip()
+
+        # V5: recover the expected machine semantically from the same message.
+        # This prevents loops such as:
+        # customer: "Juki jarum 1 sering loncat kalau buat jahit"
+        # bot:      "keluhan sudah dicatat, mesinnya apa?"
+        local_facts = _local_machine_problem_fallback(
+            text,
+            expected_machine=True,
+            pending_problem=pending_problem,
+        )
+        machine = machine or str(local_facts.get("machine") or "").strip()
+        problem = problem or str(local_facts.get("problem") or "").strip()
+
         if machine and not problem and pending_problem:
             problem = pending_problem
 
@@ -2387,6 +2555,15 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             problem = str(machines[0].get("problem") or "").strip()
 
         current_machine = str(payload.get("current_machine") or "").strip()
+
+        # V5: when the model misses a plain symptom reply, recover it locally
+        # instead of dropping into general chat or asking the same question again.
+        if not problem:
+            local_facts = _local_machine_problem_fallback(
+                text,
+                expected_problem=True,
+            )
+            problem = str(local_facts.get("problem") or "").strip()
 
         if (
             _looks_like_price_question(text)
