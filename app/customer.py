@@ -1219,23 +1219,25 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         order = await create_order(customer["id"], location, landmark, items)
         await _persist_customer_media(order["id"], msg.phone, payload)
         await clear_state(msg.phone)
+offered = await start_offer_batch(
+    order["id"],
+    notify_customer=False,
+)
 
-        offered = await start_offer_batch(order["id"])
+if offered:
+    return (
+        f"Data sudah lengkap. Nomor service Anda *{order['order_no']}*.\n\n"
+        "Permintaan sedang saya tawarkan ke mekanik yang sesuai berdasarkan "
+        "skill, radius, dan jarak. Saya akan memberi kabar setelah ada mekanik "
+        "yang merespons."
+    )
 
-        if offered:
-            return (
-                f"Data sudah lengkap. Nomor service Anda *{order['order_no']}*.\n"
-                "Permintaan sedang saya tawarkan ke mekanik yang sesuai berdasarkan "
-                "skill, radius, dan jarak. Saya akan melanjutkan proses setelah ada "
-                "mekanik yang merespons."
-            )
-
-        # start_offer_batch sudah mengirim informasi NO_TECHNICIAN ke customer.
-        # Balasan ini sengaja netral agar tidak muncul pesan yang bertentangan.
-        return (
-            f"Data service sudah lengkap dan tercatat dengan nomor *{order['order_no']}*. "
-            "Nomor ini dapat digunakan untuk mengecek perkembangan service Anda."
-        )
+return (
+    f"Data sudah lengkap. Nomor service Anda *{order['order_no']}*.\n\n"
+    "Saat ini belum ada mekanik yang tersedia dan sesuai di sekitar lokasi Anda. "
+    "Permintaan tetap tercatat dan akan ditindaklanjuti ketika ada mekanik "
+    "yang sesuai."
+)
 
     if st == "cust_update_location":
         order_no = payload.get("order_no")
