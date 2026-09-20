@@ -144,72 +144,173 @@ async def _customer_reference_media(order_id):
     return result
 
 
-async def start_offer_batch(order_id) -> bool:
+async def start_offer_batch(
+    order_id,
+    notify_customer: bool = True,
+) -> bool:
+    """
+    Membuat batch penawaran mekanik.
+
+    notify_customer:
+    - True  : fungsi ini boleh mengirim pesan NO_TECHNICIAN ke customer.
+              Dipakai oleh retry/worker/finalize_offer_window.
+    - False : caller yang mengatur sendiri pesan customer.
+              Dipakai oleh customer.py saat order baru dibuat agar tidak
+              muncul dua pesan yang bertentangan.
+    """
     async with pool().acquire() as conn:
-        order = await conn.fetchrow("SELECT * FROM service_orders WHERE id=$1", order_id)
+        order = await conn.fetchrow(
+            "SELECT * FROM service_orders WHERE id=$1",
+            order_id,
+        )
+
     if not order or order["assigned_technician_id"]:
         return False
 
     candidates = await candidate_list(order)
     batch = candidates[: settings.technician_offer_batch_size]
+
     if not batch:
-        await change_status(order_id, "NO_TECHNICIAN", "SYSTEM", "matcher", "Tidak ada kandidat lain")
-        full = await find_order(order["order_no"])
-        await send_text(
-            full["customer_wa"],
-            f"Belum ada mekanik yang tersedia untuk *{order['order_no']}*. Multitek akan menindaklanjuti secara manual.",
+        await change_status(
+            order_id,
+            "NO_TECHNICIAN",
+            "SYSTEM",
+            "matcher",
+            "Tidak ada kandidat lain",
         )
-        await send_text(settings.owner_wa_number, f"⚠️ {order['order_no']} belum mendapatkan mekanik.")
+
+        if notify_customer:
+            full = await find_order(order["order_no"])
+
+            if full and full["customer_wa"]:
+                await send_text(
+                    full["customer_wa"],
+                    (
+                        f"Saat ini belum ada mekanik yang tersedia untuk "
+                        f"*{order['order_no']}*. Permintaan tetap tercatat dan "
+                        "akan ditindaklanjuti ketika ada mekanik yang sesuai."
+                    ),
+                )
+
+        await send_text(
+            settings.owner_wa_number,
+            f"⚠️ {order['order_no']} belum mendapatkan mekanik.",
+        )
+
         return False
 
     items = await order_items(order_id)
 
+    expires = (
+        datetime.now(timezone.utc)
+        + timedelta(
+            seconds=settings.technician_offer_timeout_seconds
+        )
+    )
+
+    async with pool().acquire() as conn:
+        for candidate in batch:
+            await conn.execute(
+                """
+                INSERT INTO job_offers(
+                    order_id,
+                    technician_id,
+                    status,
+                    distance_km,
+                    coverage,
+                    average_skill,
+                    expires_at
+                )
+                VALUES($1,$2,'PENDING',$3,$4,$5,$6)
+                ON CONFLICT(order_id,technician_id) DO NOTHING
+                """,
+                order_id,
+                candidate["tech"]["id"],
+                candidate["distance"],
+                candidate["coverage"],
+                candidate["average_skill"],
+                expires,
+            )
+
+    await change_status(
+        order_id,
+        "OFFERING",
+        "SYSTEM",
+        "matcher",
+        f"Batch {len(batch)} mekanik",
+    )
+
+    item_lines = "\n".join(
+        (
+            f"{item['item_no']}. "
+            f"{item['machine_text']} — "
+            f"{item['complaint']}"
+        )
+        for item in items
+    )
+
+    # Helper ini sudah ada pada beta.1.
     customer_refs = await _customer_reference_media(
         order_id
     )
 
-    expires = datetime.now(timezone.utc) + timedelta(seconds=settings.technician_offer_timeout_seconds)
-    async with pool().acquire() as conn:
-        for c in batch:
-            await conn.execute(
-                """INSERT INTO job_offers(order_id,technician_id,status,distance_km,coverage,average_skill,expires_at)
-                   VALUES($1,$2,'PENDING',$3,$4,$5,$6)
-                   ON CONFLICT(order_id,technician_id) DO NOTHING""",
-                order_id, c["tech"]["id"], c["distance"], c["coverage"], c["average_skill"], expires,
-            )
-    await change_status(order_id, "OFFERING", "SYSTEM", "matcher", f"Batch {len(batch)} mekanik")
+    for candidate in batch:
+        tech = candidate["tech"]
 
-    item_lines = "\n".join(
-        f"{i['item_no']}. {i['machine_text']} — {i['complaint']}" for i in items
-    )
-    for c in batch:
-        tech = c["tech"]
         skill_lines = []
-        for code in c["required"]:
-            skill_lines.append(f"- {SKILL_BY_CODE[code]['name']}: {c['levels'].get(code,0)}/5")
+
+        for code in candidate["required"]:
+            skill_name = SKILL_BY_CODE[code]["name"]
+            level = candidate["levels"].get(
+                code,
+                0,
+            )
+
+            skill_lines.append(
+                f"- {skill_name}: {level}/5"
+            )
+
         await send_text(
             tech["wa_number"],
-            f"🔧 *PENAWARAN JOB {order['order_no']}*\n\n"
-            f"Mesin:\n{item_lines}\n\n"
-            f"Jarak dari titik Anda: ±{c['distance']:.1f} km\n"
-            f"Kecocokan skill: {int(c['coverage']*100)}%\n"
-            + (("\n".join(skill_lines) + "\n") if skill_lines else "")
-            + f"\nJika bersedia masuk daftar pilihan customer, balas:\n*BERMINAT {order['order_no']}*\n\n"
-            f"Jika tidak, balas:\n*TOLAK {order['order_no']}*\n\n"
-            f"Waktu respon: {settings.technician_offer_timeout_seconds // 60} menit.",
+            (
+                f"🔧 *PENAWARAN JOB "
+                f"{order['order_no']}*\n\n"
+                f"Mesin:\n"
+                f"{item_lines}\n\n"
+                f"Jarak dari titik Anda: "
+                f"±{candidate['distance']:.1f} km\n"
+                f"Kecocokan skill: "
+                f"{int(candidate['coverage'] * 100)}%\n"
+                + (
+                    "\n".join(skill_lines)
+                    + "\n"
+                    if skill_lines
+                    else ""
+                )
+                + (
+                    "\nJika bersedia masuk daftar "
+                    "pilihan customer, balas:\n"
+                    f"*BERMINAT "
+                    f"{order['order_no']}*\n\n"
+                    "Jika tidak, balas:\n"
+                    f"*TOLAK "
+                    f"{order['order_no']}*\n\n"
+                    "Waktu respon: "
+                    f"{settings.technician_offer_timeout_seconds // 60} "
+                    "menit."
+                )
+            ),
         )
 
-        # ----------------------------------------------------
-        # Referensi foto/video customer
-        # ----------------------------------------------------
+        # Kirim foto/video referensi sesudah offer teks.
+        # Kegagalan media tidak membatalkan job offer.
         for ref in customer_refs:
-            media_type = str(
-                ref["media_type"] or ""
-            ).lower()
-
             path = str(
                 ref["local_path"] or ""
             ).strip()
+
+            if not path:
+                continue
 
             item_no = (
                 ref["item_no"]
@@ -218,13 +319,18 @@ async def start_offer_batch(order_id) -> bool:
             )
 
             machine = str(
-                ref["machine_text"] or "Mesin"
+                ref["machine_text"]
+                or "Mesin"
             ).strip()
 
             caption = (
-                f"Referensi customer — "
+                "Referensi customer — "
                 f"Mesin {item_no}: {machine}"
             )
+
+            media_type = str(
+                ref["media_type"] or ""
+            ).lower()
 
             try:
                 if media_type == "image":
@@ -245,9 +351,9 @@ async def start_offer_batch(order_id) -> bool:
                     )
 
             except Exception:
-                # Media tidak boleh menggagalkan
-                # penawaran job utama.
-                continue
+                # Penawaran utama tetap valid
+                # jika salah satu file gagal dikirim.
+                pass
 
     return True
 
