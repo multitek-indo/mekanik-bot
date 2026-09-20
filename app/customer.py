@@ -160,7 +160,107 @@ def _context_label(items: list[dict] | None) -> str:
 
 
 def _normalize_customer_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+    """Normalize noisy Indonesian/Javanese only for intent detection.
+
+    The raw customer sentence is still preserved for database values.  This
+    helper makes common WhatsApp abbreviations, typos, ngoko/krama words, and
+    mixed Indonesian-Javanese easier for deterministic guards to recognize.
+    """
+    low = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    if not low:
+        return ""
+
+    phrase_rules = (
+        (r"\bdi\s*mana\b", "mana"),
+        (r"\bneng\s+endi\b", "mana"),
+        (r"\bning\s+endi\b", "mana"),
+        (r"\bsaking\s+pundi\b", "dari mana"),
+        (r"\bkados\s+pundi\b", "bagaimana"),
+        (r"\bpunyamesin\b", "punya mesin"),
+        (r"\bmesinjahit\b", "mesin jahit"),
+        (r"\bgakjalan\b", "gak jalan"),
+        (r"\bgajalan\b", "ga jalan"),
+        (r"\n", " "),
+    )
+    for pattern, replacement in phrase_rules:
+        low = re.sub(pattern, replacement, low, flags=re.I)
+
+    word_rules = {
+        # WhatsApp shorthand / common typos
+        "brp": "berapa",
+        "brapa": "berapa",
+        "biya": "biaya",
+        "byaya": "biaya",
+        "hrga": "harga",
+        "mkanik": "mekanik",
+        "meknik": "mekanik",
+        "teknsi": "teknisi",
+        "tehnisi": "teknisi",
+        "msin": "mesin",
+        "mesn": "mesin",
+        "jhkit": "jahit",
+        "jhit": "jahit",
+        "jait": "jahit",
+        "srng": "sering",
+        "lonct": "loncat",
+        "eror": "error",
+        "srvis": "servis",
+        "service": "servis",
+        "dateng": "datang",
+        "dtg": "datang",
+        "bs": "bisa",
+        "gmn": "bagaimana",
+        "gmna": "bagaimana",
+        "gimana": "bagaimana",
+        "knp": "kenapa",
+        "kpn": "kapan",
+        "dmn": "mana",
+        # Javanese ngoko / krama frequently seen in WA
+        "sampean": "anda",
+        "sampeyan": "anda",
+        "panjenengan": "anda",
+        "piro": "berapa",
+        "pinten": "berapa",
+        "piye": "bagaimana",
+        "pripun": "bagaimana",
+        "opo": "apa",
+        "nopo": "apa",
+        "menopo": "apa",
+        "ngopo": "kenapa",
+        "ngendi": "mana",
+        "endi": "mana",
+        "pundi": "mana",
+        "sopo": "siapa",
+        "sinten": "siapa",
+        "iso": "bisa",
+        "saged": "bisa",
+        "teko": "datang",
+        "teka": "datang",
+        "sesuk": "besok",
+        "saiki": "sekarang",
+        "ora": "tidak",
+        "mboten": "tidak",
+        "ono": "ada",
+        "wonten": "ada",
+        "omah": "rumah",
+        "omahe": "rumah",
+        "omahmu": "rumah",
+        "cedak": "dekat",
+        "kene": "sini",
+        "mriki": "sini",
+        "kantore": "kantor",
+        "garansine": "garansi",
+        "regane": "harga",
+        "biayane": "biaya",
+        "mekanike": "mekanik",
+        "teknisine": "teknisi",
+        "mesine": "mesin",
+    }
+
+    tokens = re.split(r"(\W+)", low)
+    tokens = [word_rules.get(token, token) for token in tokens]
+    low = "".join(tokens)
+    return re.sub(r"\s+", " ", low).strip()
 
 
 def _looks_like_question(text: str) -> bool:
@@ -177,11 +277,9 @@ def _looks_like_question(text: str) -> bool:
         "bisa ",
         "boleh ",
         "kapan ",
-        "dimana ",
-        "di mana ",
+        "mana ",
         "dari mana",
         "bagaimana",
-        "gimana",
         "kenapa",
         "mengapa",
         "kok ",
@@ -192,9 +290,14 @@ def _looks_like_question(text: str) -> bool:
         "ada garansi",
         "ada mekanik",
         "ada teknisi",
+        "ada tidak",
+        "ada nggak",
+        "ada gak",
+        "ada ga",
+        "jadi bagaimana",
+        "terus bagaimana",
     )
     return any(marker in low for marker in question_markers)
-
 
 def _looks_like_problem_statement(text: str) -> bool:
     """Conservative fallback for short symptom statements.
@@ -232,6 +335,22 @@ def _looks_like_problem_statement(text: str) -> bool:
         "ora mlaku",
         "ra mlaku",
         "ra gelem mlaku",
+        "tidak mlaku",
+        "tidak bisa mlaku",
+        "tidak gelem mlaku",
+        "ora gelem mlaku",
+        "ora muter",
+        "tidak muter",
+        "pedot",
+        "seret",
+        "getar",
+        "geter",
+        "ngebul",
+        "nggerung",
+        "setik",
+        "jahitane",
+        "tidak njahit",
+        "ora njahit",
         "tidak respon",
         "tidak merespon",
         "ga respon",
@@ -273,77 +392,212 @@ def _analysis_problem(analysis: dict | None) -> str:
     return ""
 
 
-def _problem_from_count_reply(text: str, analysis: dict | None = None) -> str:
-    """Extract a symptom included together with the machine count.
-
-    Example: "Satu mas mesinnya sering loncatan" -> "sering loncatan".
-    We only use a textual fallback when it looks like a symptom, so schedule or
-    pricing questions are not stored as machine complaints.
-    """
-    extracted = _analysis_problem(analysis)
-    if extracted:
-        return extracted
-
-    if not _looks_like_problem_statement(text):
-        return ""
-
-    if _looks_like_price_question(text):
-        return ""
-
-    topic = _side_question_topic(text)
-    if topic in {
-        "schedule",
-        "mechanic_origin",
-        "warranty",
-        "payment",
-        "duration",
-        "coverage",
-        "general",
-    }:
-        return ""
-
+def _clean_problem_fragment(text: str) -> str:
     low = _normalize_customer_text(text)
+    if not low:
+        return ""
 
     count_prefix = re.compile(
         r"^(?:(?:cuma|hanya|mung)\s+)?"
-        r"(?:1|satu|sebuah|siji|2|dua|loro|3|tiga|telung|4|empat|papat|5|lima|limang)"
-        r"(?:\s*(?:unit|mesin))?\b[\s,.;:-]*",
+        r"(?:1|satu|sebuah|siji|setunggal|2|dua|loro|kalih|3|tiga|telu|telung|"
+        r"4|empat|papat|5|lima|limo)"
+        r"(?:\s*(?:unit|mesin|buah))?\b[\s,.;:-]*",
         flags=re.I,
     )
     cleaned = count_prefix.sub("", low, count=1).strip()
 
-    # Remove conversational fillers around the actual symptom.
-    for _ in range(3):
-        new = re.sub(
-            r"^(?:mas|min|pak|bu|mbak|mba|gan|ya|iya|nih|ini)\b[\s,.;:-]*",
+    for _ in range(4):
+        new_value = re.sub(
+            r"^(?:mas|min|pak|bu|mbak|mba|gan|ya|iya|nggih|nih|ini)\b[\s,.;:-]*",
             "",
             cleaned,
             count=1,
             flags=re.I,
         ).strip()
-        if new == cleaned:
+        if new_value == cleaned:
             break
-        cleaned = new
+        cleaned = new_value
 
     cleaned = re.sub(
-        r"^(?:mesinnya|mesin saya|mesinku|mesine|mesin)\b[\s,.;:-]*",
+        r"^(?:mesinnya|mesin saya|mesinku|mesin)\b[\s,.;:-]*",
         "",
         cleaned,
         count=1,
         flags=re.I,
     ).strip()
     cleaned = re.sub(
-        r"[\s,.;:-]*(?:mas|min|pak|bu|mbak|mba|gan)$",
+        r"[\s,.;:-]*(?:mas|min|pak|bu|mbak|mba|gan|nggih)$",
         "",
         cleaned,
         count=1,
         flags=re.I,
     ).strip()
 
-    if len(cleaned) < 3 or not _looks_like_problem_statement(cleaned):
+    return cleaned
+
+
+def _problem_from_count_reply(text: str, analysis: dict | None = None) -> str:
+    """Extract a symptom even when count + symptom + another question share one message."""
+    extracted = _analysis_problem(analysis)
+    if extracted:
+        return extracted
+
+    raw = (text or "").strip()
+    if not raw:
         return ""
 
-    return cleaned[:1500]
+    # Split natural multi-intent WhatsApp messages.  Example:
+    # "siji mas, mesine sering loncat. mekanike iso teko sore?"
+    fragments = [
+        part.strip()
+        for part in re.split(
+            r"[\n.!?;,]+|\b(?:terus|trus|btw|ngomong\s*ngomong|tapi)\b",
+            raw,
+            flags=re.I,
+        )
+        if part.strip()
+    ]
+
+    candidates = fragments or [raw]
+    for fragment in candidates:
+        cleaned = _clean_problem_fragment(fragment)
+        if len(cleaned) < 3:
+            continue
+        if _looks_like_price_question(cleaned):
+            continue
+        if _side_question_topic(cleaned) in {
+            "schedule",
+            "mechanic_origin",
+            "company_identity",
+            "warranty",
+            "payment",
+            "duration",
+            "coverage",
+            "process",
+            "human",
+        }:
+            continue
+        if _looks_like_problem_statement(cleaned):
+            return cleaned[:1500]
+
+    return ""
+
+def _looks_like_name_answer(text: str) -> bool:
+    raw = (text or "").strip()
+    low = _normalize_customer_text(raw)
+    if len(raw) < 2 or not low:
+        return False
+    if _looks_like_question(raw):
+        return False
+    if _looks_like_problem_statement(raw):
+        return False
+
+    banned = (
+        "servis", "service", "mesin", "rusak", "error", "harga", "biaya",
+        "mekanik", "teknisi", "datang", "lokasi", "garansi", "booking",
+        "share location", "berapa", "bisa", "tolong carikan",
+        "sedang", "lagi", "mau", "punya", "butuh", "perlu",
+        "saya di", "aku di", "di rumah", "di pabrik", "di kantor",
+    )
+    if any(token in low for token in banned):
+        return False
+
+    cleaned = re.sub(
+        r"(?i)^\s*(?:nama\s+(?:saya|aku)\s*[:=-]?\s*|saya\s+|aku\s+|"
+        r"jenengku\s*[:=-]?\s*|asma\s+kula\s*[:=-]?\s*)",
+        "",
+        raw,
+    ).strip()
+    if not (2 <= len(cleaned) <= 100):
+        return False
+    words = cleaned.split()
+    if not (1 <= len(words) <= 8):
+        return False
+    return bool(re.search(r"[A-Za-zÀ-ÿ]", cleaned))
+
+
+def _merge_prefill_from_analysis(payload: dict, analysis: dict | None) -> bool:
+    """Remember useful machine/count facts even if the customer answered another slot."""
+    analysis = analysis or {}
+    changed = False
+
+    incoming = _machines_from_ai(analysis)
+    if incoming:
+        remembered = [
+            dict(item)
+            for item in list(payload.get("prefill_machines") or [])
+            if isinstance(item, dict)
+        ]
+        if not remembered:
+            remembered = [dict(item) for item in incoming]
+            changed = True
+        else:
+            for new_item in incoming:
+                new_machine = str(new_item.get("machine") or "").strip()
+                new_problem = str(new_item.get("problem") or "").strip()
+                matched = False
+                for old_item in remembered:
+                    old_machine = str(old_item.get("machine") or "").strip()
+                    if new_machine and old_machine.lower() == new_machine.lower():
+                        if new_problem and not str(old_item.get("problem") or "").strip():
+                            old_item["problem"] = new_problem[:1500]
+                            changed = True
+                        matched = True
+                        break
+                if not matched and (new_machine or new_problem):
+                    remembered.append(dict(new_item))
+                    changed = True
+        payload["prefill_machines"] = remembered[: settings.max_machines_per_order]
+
+    count = analysis.get("machine_count")
+    try:
+        count = int(count) if count is not None else None
+    except (TypeError, ValueError):
+        count = None
+    if count and 1 <= count <= settings.max_machines_per_order:
+        if payload.get("pending_machine_count") != count:
+            payload["pending_machine_count"] = count
+            changed = True
+
+    return changed
+
+
+def _landmark_from_text_fallback(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    location_cues = (
+        "depan", "belakang", "samping", "sebelah", "dekat", "gang", "gg ",
+        "jalan ", "jl ", "rt ", "rw ", "masjid", "mushola", "musala",
+        "alfamart", "indomaret", "pasar", "sekolah", "toko",
+        "pertigaan", "perempatan", "jembatan", "lapangan",
+        "rumah warna", "pagar", "gerbang",
+    )
+    parts = [
+        part.strip()
+        for part in re.split(r"[\n.!?;,]+", raw)
+        if part.strip()
+    ]
+    for part in parts or [raw]:
+        low = _normalize_customer_text(part)
+        if any(cue in low for cue in location_cues):
+            return part[:500]
+    return ""
+
+
+def _media_finish_requested(text: str) -> bool:
+    low = _normalize_customer_text(text)
+    if not low:
+        return False
+    done_phrases = (
+        "selesai", "sudah cukup", "sudah", "cukup", "udah", "wis", "wes",
+        "lewati", "skip", "tidak ada", "ga ada", "gak ada", "nggak ada",
+        "ngga ada", "ora ono", "ora ana", "belum ada", "ga bisa",
+        "gak bisa", "nggak bisa",
+    )
+    first = re.split(r"[,.;!?]|\b(?:tapi|terus|trus)\b", low, maxsplit=1)[0].strip()
+    return first in done_phrases
 
 
 def _price_question_kind(text: str) -> str | None:
@@ -842,7 +1096,7 @@ def _state_resume_prompt(state: str, payload: dict) -> str:
         return "Kalau sudah jelas, boleh sebutkan nama Anda atau nama perusahaan?"
 
     if state == "cust_machine_count":
-        return "Lalu, ada berapa unit mesin yang ingin dicek?"
+        return "Kalau lanjut, ada berapa unit mesin yang mau dicek?"
 
     if state == "cust_machine_desc":
         idx = int(payload.get("machine_index") or 1)
@@ -850,10 +1104,10 @@ def _state_resume_prompt(state: str, payload: dict) -> str:
 
     if state == "cust_machine_problem":
         machine = str(payload.get("current_machine") or "mesin tersebut").strip()
-        return f"Untuk lanjut, apa keluhan pada *{machine}*?"
+        return f"Kalau lanjut, apa keluhan pada *{machine}*? Ceritakan gejalanya saja—misalnya loncat, bunyi kasar, error, atau tidak jalan."
 
     if state == "cust_location":
-        return "Untuk lanjut mencari mekanik terdekat, silakan kirim *Share Location* lokasi mesin."
+        return "Kalau lanjut, kirim *Share Location* lokasi mesinnya ya supaya saya bisa mencari mekanik terdekat."
 
     if state == "cust_location_confirm":
         return "Kalau titik lokasi tadi sudah benar, jawab *iya* atau *betul*. Kalau salah, kirim Share Location ulang."
@@ -889,7 +1143,7 @@ def _side_question_topic(text: str) -> str | None:
     if _looks_like_price_question(text):
         return "price"
 
-    if "garansi" in low or "warranty" in low:
+    if any(x in low for x in ("garansi", "warranty")):
         return "warranty"
 
     if any(
@@ -897,29 +1151,68 @@ def _side_question_topic(text: str) -> str | None:
         for marker in (
             "cara bayar",
             "cara pembayaran",
-            "bayarnya gimana",
-            "bayar gimana",
+            "bayarnya bagaimana",
+            "bayar bagaimana",
             "transfer kemana",
             "transfer ke mana",
+            "transfer mana",
             "bisa cash",
             "bisa tunai",
             "bisa qris",
             "pembayaran bagaimana",
+            "bayare bagaimana",
         )
     ):
         return "payment"
 
+    # Questions directed at the bot/company itself, e.g. "sampean rumahnya mana?"
     if any(
         marker in low
         for marker in (
-            "mekaniknya dari mana",
-            "teknisinya dari mana",
+            "anda rumah",
+            "anda mana",
+            "kamu mana",
+            "admin mana",
+            "anda siapa",
+            "kamu siapa",
+            "ini bot",
+            "bot atau admin",
+            "rumah anda",
+            "rumahnya mana",
+            "alamatnya mana",
+            "alamat anda",
+            "anda alamat",
+            "kantor mana",
+            "alamat kantor",
+            "lokasi kantor",
+            "multitek mana",
+            "multitek dari mana",
+            "anda dari mana",
+            "kamu dari mana",
+            "admin dari mana",
+        )
+    ):
+        return "company_identity"
+
+    if re.search(r"\b(?:anda|kamu|admin)\b.*\b(?:rumah|alamat|kantor|mana|siapa)\b", low):
+        return "company_identity"
+
+    if re.search(r"\b(?:mekanik|teknisi)\b.*\b(?:mana|asal|daerah)\b", low):
+        return "mechanic_origin"
+
+    if any(
+        marker in low
+        for marker in (
             "mekanik dari mana",
             "teknisi dari mana",
             "mekanik mana",
             "teknisi mana",
             "lokasi mekanik",
             "lokasi teknisi",
+            "mekanik rumah",
+            "teknisi rumah",
+            "mekanik daerah mana",
+            "teknisi daerah mana",
         )
     ):
         return "mechanic_origin"
@@ -948,6 +1241,7 @@ def _side_question_topic(text: str) -> str | None:
             "maunya sore",
             "maunya pagi",
             "maunya malam",
+            "sekarang bisa",
         )
     ):
         return "schedule"
@@ -958,8 +1252,8 @@ def _side_question_topic(text: str) -> str | None:
             "berapa lama",
             "lama perbaikan",
             "lama servis",
-            "lama service",
             "selesai berapa lama",
+            "pengerjaan berapa lama",
         )
     ):
         return "duration"
@@ -969,13 +1263,69 @@ def _side_question_topic(text: str) -> str | None:
         for marker in (
             "daerah saya ada mekanik",
             "daerah saya ada teknisi",
+            "ada mekanik dekat",
+            "ada teknisi dekat",
+            "mekanik dekat sini",
+            "teknisi dekat sini",
             "bisa ke daerah",
+            "bisa sampai",
+            "sampai daerah",
+            "bisa melayani",
             "bisa ke lokasi saya",
             "jangkau daerah",
             "jangkau lokasi",
+            "melayani daerah",
+            "melayani sampai",
         )
     ):
         return "coverage"
+
+    if any(
+        marker in low
+        for marker in (
+            "alur servis",
+            "alur service",
+            "prosesnya bagaimana",
+            "cara panggil mekanik",
+            "cara pesan mekanik",
+            "cara order",
+            "selanjutnya bagaimana",
+        )
+    ):
+        return "process"
+
+    if any(
+        marker in low
+        for marker in (
+            "admin manusia",
+            "bicara sama admin",
+            "bicara dengan admin",
+            "hubungi admin",
+            "orang asli",
+            "customer service manusia",
+            "cs manusia",
+        )
+    ):
+        return "human"
+
+    if any(
+        marker in low
+        for marker in (
+            "bisa diservis",
+            "bisa diperbaiki",
+            "melayani mesin",
+            "bisa service",
+            "bisa servis",
+        )
+    ):
+        return "service_capability"
+
+    # A question about a symptom is not an unrelated interruption.  It can be
+    # recorded as the complaint while we answer cautiously about diagnosis.
+    if _looks_like_problem_statement(low) and any(
+        marker in low for marker in ("kenapa", "kok ", "penyebab", "akibat apa")
+    ):
+        return "diagnosis"
 
     if _looks_like_question(text):
         return "general"
@@ -994,6 +1344,108 @@ def _append_resume(answer: str, resume: str) -> str:
     return answer + "\n\n" + resume
 
 
+async def _common_question_answer(
+    msg: IncomingMessage,
+    topic: str | None,
+    text: str,
+    context_items: list[dict] | None = None,
+    analysis: dict | None = None,
+) -> str | None:
+    analysis = analysis or {}
+    context_items = list(context_items or [])
+
+    if topic == "price" or analysis.get("intent") == "PRICE_QUESTION":
+        return await price_answer(text, context_items)
+
+    if analysis.get("intent") == "STATUS_QUESTION":
+        active = await active_order_for_customer(msg.phone)
+        if active:
+            return await customer_status_summary(active["order_no"])
+        return (
+            "Untuk proses yang sedang kita isi ini belum ada nomor service, "
+            "jadi status pencarian mekanik memang belum terbentuk."
+        )
+
+    if topic == "company_identity":
+        return (
+            "Saya admin virtual Multitek Service, jadi saya bukan mekanik yang datang langsung "
+            "dan tidak punya alamat rumah pribadi. Untuk kunjungan service, saya akan mencarikan "
+            "mekanik yang skill-nya sesuai dan paling masuk radius dari lokasi mesin Anda."
+        )
+
+    if topic == "schedule":
+        return (
+            "Bisa saya bantu carikan jadwal, tetapi waktunya belum bisa saya janjikan "
+            "sebelum ada mekanik yang menerima pekerjaan. Setelah ada kandidat yang cocok, "
+            "jadwal kedatangannya bisa dikonfirmasi sesuai ketersediaan mekanik."
+        )
+
+    if topic == "mechanic_origin":
+        return (
+            "Mekanik tidak berasal dari satu tempat tertentu. Sistem mencari mekanik aktif "
+            "yang skill-nya sesuai dan masih masuk radius dari lokasi mesin. Nama dan jaraknya "
+            "baru bisa diketahui setelah ada kandidat yang merespons."
+        )
+
+    if topic == "warranty":
+        return (
+            "Garansi mengikuti pekerjaan yang benar-benar dilakukan. Setelah diagnosis dan "
+            "jenis perbaikannya jelas, ketentuan garansi jasa atau spare part bisa dikonfirmasi "
+            "sebelum pekerjaan disetujui."
+        )
+
+    if topic == "payment":
+        return (
+            "Pembayaran mengikuti tahapan order. Jangan transfer sebelum ada instruksi resmi "
+            "di percakapan service. Booking dihitung dari jarak dan menjadi pengurang jasa "
+            "jika perbaikan berhasil."
+        )
+
+    if topic == "duration":
+        return (
+            "Lama pengerjaan tergantung jenis kerusakan dan kebutuhan spare part. Sebelum "
+            "diagnosis saya belum bisa memberi waktu pasti; setelah dicek, estimasinya bisa "
+            "dijelaskan sebelum pekerjaan dilanjutkan."
+        )
+
+    if topic == "coverage":
+        return (
+            "Bisa dicek. Ketersediaan mekanik ditentukan dari *Share Location* lokasi mesin, "
+            "lalu sistem mencocokkan skill, radius layanan, dan jarak mekanik."
+        )
+
+    if topic == "process":
+        return (
+            "Alurnya sederhana: saya catat mesin dan keluhannya, minta lokasi serta foto/video "
+            "jika ada, lalu sistem mencari mekanik yang sesuai. Setelah ada mekanik yang "
+            "merespons, proses booking dan kedatangan dilanjutkan dari order yang sama."
+        )
+
+    if topic == "human":
+        return (
+            "Saya admin virtual yang membantu intake dan alur service. Bagian yang membutuhkan "
+            "keputusan manual tetap dapat ditinjau oleh pengelola Multitek melalui order yang tercatat."
+        )
+
+    if topic == "service_capability":
+        return (
+            "Bisa saya cek dan carikan mekanik yang sesuai. Jenis kerusakan tetap perlu dicatat "
+            "supaya pencarian skill mekaniknya tidak salah."
+        )
+
+    if topic == "diagnosis":
+        return (
+            "Gejala seperti itu bisa punya beberapa penyebab, jadi saya tidak akan menebak "
+            "kerusakan final sebelum mesin dicek. Keluhannya tetap saya catat supaya mekanik "
+            "punya gambaran awal."
+        )
+
+    if topic == "general":
+        return await conversational_customer_reply(text)
+
+    return None
+
+
 async def _answer_side_question(
     msg: IncomingMessage,
     state: str,
@@ -1009,82 +1461,25 @@ async def _answer_side_question(
     resume = _state_resume_prompt(state, payload)
     context_items = list(context_items or _interruption_context_items(payload))
 
-    if (
-        _looks_like_price_question(text)
-        or analysis.get("intent") == "PRICE_QUESTION"
-    ):
-        answer = await price_answer(text, context_items)
-        return _append_resume(answer, resume)
-
     if analysis.get("control") == "GREETING":
-        return _append_resume("Halo.", resume)
+        return _append_resume("Halo, silakan.", resume)
 
     topic = _side_question_topic(text)
+    if topic is None and analysis.get("intent") == "PRICE_QUESTION":
+        topic = "price"
+    if topic is None and analysis.get("intent") == "STATUS_QUESTION":
+        topic = "general"
 
-    if analysis.get("intent") == "STATUS_QUESTION":
-        active = await active_order_for_customer(msg.phone)
-        if active:
-            answer = await customer_status_summary(active["order_no"])
-        else:
-            answer = (
-                "Untuk proses yang sedang kita isi ini belum ada nomor service, "
-                "jadi belum ada status matching mekanik yang bisa dicek."
-            )
-        return _append_resume(answer, resume)
-
-    if topic == "schedule":
-        answer = (
-            "Waktu kedatangan belum bisa saya janjikan sebelum ada mekanik yang menerima job. "
-            "Setelah ada mekanik yang cocok dan merespons, jadwal kedatangan bisa dikonfirmasi "
-            "berdasarkan ketersediaannya."
-        )
-        return _append_resume(answer, resume)
-
-    if topic == "mechanic_origin":
-        answer = (
-            "Sistem mencari mekanik aktif yang skill-nya sesuai dan masih dalam radius dari lokasi mesin. "
-            "Nama serta jaraknya baru bisa ditampilkan setelah ada kandidat yang merespons."
-        )
-        return _append_resume(answer, resume)
-
-    if topic == "warranty":
-        answer = (
-            "Ketentuan garansi tidak saya tetapkan sebelum jenis pekerjaan diketahui. "
-            "Setelah diagnosis dan pekerjaan disepakati, garansi jasa atau spare part perlu "
-            "mengikuti pekerjaan yang benar-benar dilakukan."
-        )
-        return _append_resume(answer, resume)
-
-    if topic == "payment":
-        answer = (
-            "Instruksi pembayaran diberikan pada tahap transaksi yang sesuai. "
-            "Sebaiknya jangan transfer sebelum ada instruksi resmi pada order. "
-            "Booking dihitung dari jarak dan menjadi pengurang jasa jika perbaikan berhasil."
-        )
-        return _append_resume(answer, resume)
-
-    if topic == "duration":
-        answer = (
-            "Lama perbaikan belum bisa dipastikan sebelum mekanik melakukan diagnosis. "
-            "Setelah kondisi mesin diketahui, estimasi pekerjaan bisa dijelaskan sebelum dilanjutkan."
-        )
-        return _append_resume(answer, resume)
-
-    if topic == "coverage":
-        answer = (
-            "Untuk memastikan ada mekanik yang bisa menjangkau lokasi Anda, saya perlu titik *Share Location*. "
-            "Sistem mencocokkan skill, radius layanan, dan jarak mekanik dari lokasi mesin."
-        )
-        return _append_resume(answer, resume)
-
-    # Only route to free-form conversation when the text itself looks like
-    # a question. AI can occasionally label short symptom statements as
-    # GENERAL_QUESTION; those must remain available to the active intake state.
-    if topic == "general":
-        answer = await conversational_customer_reply(text)
-        return _append_resume(answer, resume)
-
-    return None
+    answer = await _common_question_answer(
+        msg,
+        topic,
+        text,
+        context_items=context_items,
+        analysis=analysis,
+    )
+    if answer is None:
+        return None
+    return _append_resume(answer, resume)
 
 
 async def _apply_machine_count(
@@ -1371,6 +1766,10 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         fields = analysis.get("fields") or {}
         name = str(fields.get("name") or "").strip()
 
+        remembered_extra = _merge_prefill_from_analysis(payload, analysis)
+        if remembered_extra:
+            await set_state(msg.phone, "cust_name", payload)
+
         if not name:
             side = await _answer_side_question(
                 msg,
@@ -1381,16 +1780,18 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             if side is not None:
                 return side
 
-            name = re.sub(
-                r"(?i)^\s*(?:nama\s+(?:saya|aku)\s*[:=-]?\s*|"
-                r"saya\s+|aku\s+|jenengku\s*[:=-]?\s*|"
-                r"asma\s+kula\s*[:=-]?\s*)",
-                "",
-                text,
-            ).strip()
+            if _looks_like_name_answer(text):
+                name = re.sub(
+                    r"(?i)^\s*(?:nama\s+(?:saya|aku)\s*[:=-]?\s*|"
+                    r"saya\s+|aku\s+|jenengku\s*[:=-]?\s*|"
+                    r"asma\s+kula\s*[:=-]?\s*)",
+                    "",
+                    text,
+                ).strip()
 
         if not name or len(name) < 2:
-            return "Saya belum menangkap namanya. Boleh sebutkan nama Anda atau perusahaan?"
+            prefix = "Info mesinnya sudah saya catat dulu. " if remembered_extra else ""
+            return prefix + "Saya belum menangkap namanya. Boleh sebutkan nama Anda atau perusahaan?"
 
         async with pool().acquire() as conn:
             await conn.execute(
@@ -1485,6 +1886,13 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                     # Keep the symptom until the machine description is supplied.
                     payload["pending_problem"] = problem_hint
 
+        # Keep useful machine/problem details even if the customer still has not
+        # answered the quantity question. This avoids asking them to repeat data.
+        if prefill:
+            payload["prefill_machines"] = prefill[: settings.max_machines_per_order]
+        if count is None and (prefill or problem_hint or extra_machines):
+            await set_state(msg.phone, "cust_machine_count", payload)
+
         if (
             _looks_like_price_question(text)
             or analysis.get("intent") == "PRICE_QUESTION"
@@ -1516,16 +1924,22 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 prefill,
             )
 
-            # If the same message also contains a real side question, answer it
-            # after recording the count, then resume from the new intake state.
-            if not problem_hint:
-                if len(payload.get("items") or []) >= int(count):
-                    next_state = "cust_location"
-                elif payload.get("current_machine"):
-                    next_state = "cust_machine_problem"
-                else:
-                    next_state = "cust_machine_desc"
+            # A single WhatsApp message can contain count + symptom + another
+            # question. Record the usable data first, then answer the side question
+            # without losing the newly advanced state.
+            if len(payload.get("items") or []) >= int(count):
+                next_state = "cust_location"
+            elif payload.get("current_machine"):
+                next_state = "cust_machine_problem"
+            else:
+                next_state = "cust_machine_desc"
 
+            side_topic = _side_question_topic(text)
+            if side_topic in {
+                "schedule", "mechanic_origin", "company_identity", "warranty",
+                "payment", "duration", "coverage", "process", "human",
+                "service_capability", "diagnosis", "price", "general",
+            }:
                 side = await _answer_side_question(
                     msg,
                     next_state,
@@ -1602,38 +2016,71 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         if analysis.get("control") == "GREETING":
             return "Halo. Kita lanjut ya. Mesin yang bermasalah jenis/merk/modelnya apa?"
 
-        strong_topic = _side_question_topic(text)
-        if strong_topic in {
-            "schedule",
-            "mechanic_origin",
-            "warranty",
-            "payment",
-            "duration",
-            "coverage",
-        }:
-            side = await _answer_side_question(
-                msg,
-                st,
-                payload,
-                analysis,
-            )
-            if side is not None:
-                return side
+        side_topic = _side_question_topic(text)
 
         if machine:
             if problem:
-                return await _finish_machine_item(
+                next_prompt = await _finish_machine_item(
                     msg.phone,
                     payload,
                     machine,
                     problem,
                 )
+                count = int(payload.get("machine_count") or len(payload.get("items") or []))
+                next_state = (
+                    "cust_location"
+                    if len(payload.get("items") or []) >= count
+                    else "cust_machine_desc"
+                )
+            else:
+                payload["current_machine"] = machine[:300]
+                await set_state(msg.phone, "cust_machine_problem", payload)
+                next_state = "cust_machine_problem"
+                next_prompt = (
+                    f"Baik, saya catat *{machine}*. "
+                    "Ceritakan gejalanya ya—misalnya loncat, bunyi kasar, error, atau tidak jalan."
+                )
 
-            payload["current_machine"] = machine[:300]
-            await set_state(msg.phone, "cust_machine_problem", payload)
+            if side_topic in {
+                "schedule", "mechanic_origin", "company_identity", "warranty",
+                "payment", "duration", "coverage", "process", "human",
+                "service_capability", "diagnosis", "general",
+            }:
+                side = await _answer_side_question(
+                    msg,
+                    next_state,
+                    payload,
+                    analysis,
+                )
+                if side is not None:
+                    return side
+
+            return next_prompt
+
+        # If the customer gives the symptom before naming the machine, keep it.
+        # We can ask only for the missing machine instead of forcing repetition.
+        if not machine and problem and side_topic not in {
+            "schedule", "mechanic_origin", "company_identity", "warranty",
+            "payment", "duration", "coverage", "process", "human", "price",
+        }:
+            payload["pending_problem"] = problem[:1500]
+            await set_state(msg.phone, "cust_machine_desc", payload)
             return (
-                f"Baik, saya catat *{machine}*. "
-                "Keluhannya bagaimana? Ceritakan saja dengan bahasa sehari-hari."
+                "Keluhannya sudah saya catat. Tinggal sebutkan mesin yang dimaksud—"
+                "merek, jenis, atau model yang Anda tahu saja."
+            )
+
+        if (
+            not machine
+            and not problem
+            and _looks_like_problem_statement(text)
+            and not _looks_like_question(text)
+        ):
+            payload["pending_problem"] = text[:1500]
+            await set_state(msg.phone, "cust_machine_desc", payload)
+            return (
+                "Keluhannya sudah saya catat. Tinggal sebutkan mesin yang dimaksud—"
+                "merek, jenis, atau model yang Anda tahu saja."
             )
 
         side = await _answer_side_question(
@@ -1714,45 +2161,54 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 f"Apa keluhan pada *{current_machine or 'mesin tersebut'}*?"
             )
 
-        strong_topic = _side_question_topic(text)
-        if strong_topic in {
-            "schedule",
-            "mechanic_origin",
-            "warranty",
-            "payment",
-            "duration",
-            "coverage",
-        }:
-            side = await _answer_side_question(
-                msg,
-                st,
-                payload,
-                analysis,
-            )
-            if side is not None:
-                return side
+        side_topic = _side_question_topic(text)
+
+        if not problem and _looks_like_problem_statement(text):
+            # Preserve the customer's wording if NLU did not extract a clean problem.
+            # This also works for mixed messages such as
+            # "sering loncat mas, mekanike iso teko sore?".
+            fragments = [
+                p.strip()
+                for p in re.split(r"[\n.!?;,]+", text)
+                if p.strip()
+            ]
+            for fragment in fragments or [text]:
+                if _looks_like_problem_statement(fragment) and _side_question_topic(fragment) not in {
+                    "schedule", "mechanic_origin", "company_identity", "warranty",
+                    "payment", "duration", "coverage", "process", "human",
+                }:
+                    problem = fragment[:1500]
+                    break
 
         if problem:
-            return await _finish_machine_item(
+            next_prompt = await _finish_machine_item(
                 msg.phone,
                 payload,
                 current_machine,
                 problem,
             )
-
-        # AI can occasionally classify a short symptom such as "sering loncat mas"
-        # as GENERAL_QUESTION. If the text itself is a declarative symptom, keep it
-        # as the complaint instead of sending it to free-form conversation.
-        if (
-            _looks_like_problem_statement(text)
-            and not _looks_like_question(text)
-        ):
-            return await _finish_machine_item(
-                msg.phone,
-                payload,
-                current_machine,
-                text[:1500],
+            count = int(payload.get("machine_count") or len(payload.get("items") or []))
+            next_state = (
+                "cust_location"
+                if len(payload.get("items") or []) >= count
+                else "cust_machine_desc"
             )
+
+            if side_topic in {
+                "schedule", "mechanic_origin", "company_identity", "warranty",
+                "payment", "duration", "coverage", "process", "human",
+                "service_capability", "diagnosis", "general",
+            }:
+                side = await _answer_side_question(
+                    msg,
+                    next_state,
+                    payload,
+                    analysis,
+                )
+                if side is not None:
+                    return side
+
+            return next_prompt
 
         side = await _answer_side_question(
             msg,
@@ -1825,10 +2281,34 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             control = analysis.get("control")
 
         if control == "YES":
-            return await _begin_customer_media(msg.phone, payload)
+            next_prompt = await _begin_customer_media(msg.phone, payload)
+            topic = _side_question_topic(text)
+            if topic not in {None, "general"}:
+                answer = await _common_question_answer(
+                    msg,
+                    topic,
+                    text,
+                    context_items=_interruption_context_items(payload),
+                    analysis=analysis or {},
+                )
+                if answer:
+                    return _append_resume(answer, next_prompt)
+            return next_prompt
 
         if control == "NO":
-            return "Baik, berarti titik tadi belum benar. Silakan kirim *Share Location* yang benar."
+            next_prompt = "Baik, berarti titik tadi belum benar. Silakan kirim *Share Location* yang benar."
+            topic = _side_question_topic(text)
+            if topic not in {None, "general"}:
+                answer = await _common_question_answer(
+                    msg,
+                    topic,
+                    text,
+                    context_items=_interruption_context_items(payload),
+                    analysis=analysis or {},
+                )
+                if answer:
+                    return _append_resume(answer, next_prompt)
+            return next_prompt
 
         if text:
             if analysis is None:
@@ -1942,8 +2422,21 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             "belum ada",
         }
 
-        if low in finished:
-            return await _advance_customer_media(msg.phone, payload)
+        if low in finished or _media_finish_requested(text):
+            next_prompt = await _advance_customer_media(msg.phone, payload)
+            analysis = await understand() if text else {}
+            topic = _side_question_topic(text)
+            if topic not in {None, "general"}:
+                answer = await _common_question_answer(
+                    msg,
+                    topic,
+                    text,
+                    context_items=items,
+                    analysis=analysis,
+                )
+                if answer:
+                    return _append_resume(answer, next_prompt)
+            return next_prompt
 
         analysis = await understand() if text else {}
         side = await _answer_side_question(
@@ -1983,9 +2476,11 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             "wes cukup",
         )
 
+        first_clause = re.split(r"[,.;!?]", low_landmark, maxsplit=1)[0].strip()
         no_landmark = (
             control in {"SKIP", "NO"}
             or low_landmark in no_landmark_words
+            or first_clause in no_landmark_words
             or any(word in low_landmark for word in (
                 "tidak ada patokan",
                 "gak ada patokan",
@@ -1996,32 +2491,27 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             ))
         )
 
-        analysis = await understand() if text and not no_landmark else {}
+        analysis = await understand() if text else {}
         landmark_from_ai = str((analysis.get("fields") or {}).get("landmark") or "").strip()
+        landmark_fallback = _landmark_from_text_fallback(text)
+        strong_topic = _side_question_topic(text)
 
-        strong_topic = _side_question_topic(text) if not no_landmark else None
+        # If the message is only an interruption, answer it and keep the
+        # landmark state unchanged. If it also contains a real landmark (or a
+        # clear "tidak ada/cukup"), finish the order in this same turn.
         if (
-            strong_topic in {
-                "price",
-                "schedule",
-                "mechanic_origin",
-                "warranty",
-                "payment",
-                "duration",
-                "coverage",
-            }
-            or analysis.get("intent") == "STATUS_QUESTION"
-        ):
-            side = await _answer_side_question(
-                msg,
-                st,
-                payload,
-                analysis,
+            not no_landmark
+            and not landmark_from_ai
+            and not landmark_fallback
+            and (
+                strong_topic in {
+                    "price", "schedule", "mechanic_origin", "company_identity",
+                    "warranty", "payment", "duration", "coverage", "process",
+                    "human", "service_capability", "diagnosis", "general",
+                }
+                or analysis.get("intent") == "STATUS_QUESTION"
             )
-            if side is not None:
-                return side
-
-        if not no_landmark and not landmark_from_ai:
+        ):
             side = await _answer_side_question(
                 msg,
                 st,
@@ -2035,8 +2525,14 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             landmark = ""
         elif landmark_from_ai:
             landmark = landmark_from_ai[:500]
+        elif landmark_fallback:
+            landmark = landmark_fallback[:500]
         else:
-            landmark = text[:500]
+            return (
+                "Saya belum menangkap patokannya. Contohnya *depan masjid*, "
+                "*sebelah Indomaret*, atau *rumah pagar hitam*. Kalau tidak ada, "
+                "cukup jawab *tidak ada*."
+            )
 
         customer = await get_or_create_customer(msg.phone)
         items = payload.get("items") or []
@@ -2059,19 +2555,33 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         )
 
         if offered:
-            return (
+            final_reply = (
                 f"Data sudah lengkap. Nomor service Anda *{order['order_no']}*.\n\n"
                 "Permintaan sedang saya tawarkan ke mekanik yang sesuai berdasarkan "
                 "skill, radius, dan jarak. Saya akan memberi kabar setelah ada mekanik "
                 "yang merespons."
             )
+        else:
+            final_reply = (
+                f"Data sudah lengkap. Nomor service Anda *{order['order_no']}*.\n\n"
+                "Saat ini belum ada mekanik yang tersedia dan sesuai di sekitar lokasi Anda. "
+                "Permintaan tetap tercatat dan akan ditindaklanjuti ketika ada mekanik "
+                "yang sesuai."
+            )
 
-        return (
-            f"Data sudah lengkap. Nomor service Anda *{order['order_no']}*.\n\n"
-            "Saat ini belum ada mekanik yang tersedia dan sesuai di sekitar lokasi Anda. "
-            "Permintaan tetap tercatat dan akan ditindaklanjuti ketika ada mekanik "
-            "yang sesuai."
-        )
+        if strong_topic not in {None, "general"}:
+            side_answer = await _common_question_answer(
+                msg,
+                strong_topic,
+                text,
+                context_items=list(items),
+                analysis=analysis,
+            )
+            if side_answer:
+                return _append_resume(side_answer, final_reply)
+
+        return final_reply
+
 
     if st == "cust_update_location":
         order_no = payload.get("order_no")
@@ -2186,6 +2696,10 @@ def _simple_greeting_reply(text: str) -> str | None:
         return "Ya. Ada yang bisa saya bantu terkait mesin atau kebutuhan teknisi?"
 
     time_greetings = {
+        "SUGENG ENJING": "Sugeng enjing.",
+        "SUGENG SIANG": "Sugeng siang.",
+        "SUGENG SONTEN": "Sugeng sonten.",
+        "SUGENG DALU": "Sugeng dalu.",
         "PAGI": "Pagi juga.",
         "SELAMAT PAGI": "Selamat pagi.",
         "PAGI MAS": "Pagi juga.",
@@ -2238,11 +2752,20 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
     if "STATUS" in up and m:
         return await customer_status_summary(m.group(1))
 
-    classified = await classify_customer_message(text)
+    # Use the richer NLU here as well. It is better at typo-heavy Indonesian,
+    # Javanese ngoko/krama, and mixed sentences than the lightweight classifier.
+    try:
+        classified = await understand_customer_message(
+            text,
+            state="",
+            context={},
+        )
+    except Exception:
+        classified = await classify_customer_message(text)
 
     if (
         _looks_like_price_question(text)
-        or classified["intent"] == "PRICE_QUESTION"
+        or classified.get("intent") == "PRICE_QUESTION"
     ):
         await _remember_price_service_context(msg, classified)
 
@@ -2252,7 +2775,7 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
 
         return await price_answer(text, context_items)
 
-    if classified["intent"] == "STATUS_QUESTION":
+    if classified.get("intent") == "STATUS_QUESTION":
         if active:
             return await customer_status_summary(active["order_no"])
         return (
@@ -2260,8 +2783,20 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
             "Jika Anda punya nomor MTK, kirim misalnya: *STATUS MTK-260919-0003*."
         )
 
-    if classified["intent"] == "SERVICE_REQUEST":
+    if classified.get("intent") == "SERVICE_REQUEST":
         return await _start_intake(msg, classified)
+
+    # Answer common off-flow questions directly even when no intake state exists.
+    topic = _side_question_topic(text)
+    common = await _common_question_answer(
+        msg,
+        topic,
+        text,
+        context_items=(await _order_context_items(active["id"]) if active else []),
+        analysis=classified,
+    )
+    if common is not None:
+        return common
 
     return await conversational_customer_reply(text)
 
