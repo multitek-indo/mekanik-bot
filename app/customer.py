@@ -1846,11 +1846,13 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         problem_hint = _problem_from_count_reply(text, analysis)
         extra_machines = list(analysis.get("machines") or [])
-        prefill = [
+        original_prefill = [
             dict(item)
             for item in list(payload.get("prefill_machines") or [])
             if isinstance(item, dict)
         ]
+        original_pending_problem = str(payload.get("pending_problem") or "").strip()
+        prefill = [dict(item) for item in original_prefill]
         if extra_machines:
             prefill = [
                 dict(item)
@@ -1888,9 +1890,19 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         # Keep useful machine/problem details even if the customer still has not
         # answered the quantity question. This avoids asking them to repeat data.
-        if prefill:
-            payload["prefill_machines"] = prefill[: settings.max_machines_per_order]
-        if count is None and (prefill or problem_hint or extra_machines):
+        # Only write conversation state when this message actually changed the
+        # remembered machine/problem data. A pure side question such as
+        # "Sampean rumahnya mana?" must not trigger an unnecessary DB write.
+        new_prefill = prefill[: settings.max_machines_per_order]
+        if new_prefill:
+            payload["prefill_machines"] = new_prefill
+
+        state_payload_changed = (
+            new_prefill != original_prefill
+            or str(payload.get("pending_problem") or "").strip()
+            != original_pending_problem
+        )
+        if count is None and state_payload_changed:
             await set_state(msg.phone, "cust_machine_count", payload)
 
         if (
