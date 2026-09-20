@@ -159,12 +159,100 @@ def _context_label(items: list[dict] | None) -> str:
     return f"{len(values)} mesin yang sudah Anda jelaskan"
 
 
-def _looks_like_price_question(text: str) -> bool:
-    low = re.sub(r"\s+", " ", (text or "").lower()).strip()
+def _normalize_customer_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+
+def _looks_like_question(text: str) -> bool:
+    low = _normalize_customer_text(text)
     if not low:
         return False
 
-    markers = (
+    if "?" in (text or ""):
+        return True
+
+    question_markers = (
+        "apa ",
+        "apakah ",
+        "bisa ",
+        "boleh ",
+        "kapan ",
+        "dimana ",
+        "di mana ",
+        "dari mana",
+        "bagaimana",
+        "gimana",
+        "kenapa",
+        "mengapa",
+        "kok ",
+        "siapa",
+        "berapa",
+        "termasuk",
+        "sudah termasuk",
+        "ada garansi",
+        "ada mekanik",
+        "ada teknisi",
+    )
+    return any(marker in low for marker in question_markers)
+
+
+def _price_question_kind(text: str) -> str | None:
+    low = _normalize_customer_text(text)
+    if not low:
+        return None
+
+    if "booking" in low and any(
+        marker in low
+        for marker in (
+            "berapa",
+            "biaya",
+            "harga",
+            "tarif",
+            "termasuk",
+            "masuk jasa",
+            "pengurang",
+            "potong",
+            "dipotong",
+            "kembali",
+            "refund",
+        )
+    ):
+        return "booking"
+
+    if any(x in low for x in ("spare part", "sparepart", "suku cadang")) and (
+        _looks_like_question(text)
+        or any(x in low for x in ("harga", "biaya", "tarif", "termasuk", "ganti"))
+    ):
+        return "sparepart"
+
+    if any(
+        marker in low
+        for marker in (
+            "tidak jadi diperbaiki",
+            "gak jadi diperbaiki",
+            "ga jadi diperbaiki",
+            "nggak jadi diperbaiki",
+            "tidak lanjut perbaikan",
+            "gak lanjut perbaikan",
+            "ga lanjut perbaikan",
+        )
+    ):
+        return "not_repaired"
+
+    tier_markers = {
+        "inspection": ("pengecekan", "cek saja", "biaya cek", "harga cek"),
+        "light": ("ringan",),
+        "medium": ("sedang",),
+        "heavy": ("berat",),
+    }
+    for kind, markers in tier_markers.items():
+        if any(marker in low for marker in markers) and (
+            _looks_like_question(text)
+            or any(x in low for x in ("harga", "biaya", "tarif", "ongkos"))
+        ):
+            return kind
+
+    generic_markers = (
         "berapa biaya",
         "biaya berapa",
         "biayanya",
@@ -179,8 +267,17 @@ def _looks_like_price_question(text: str) -> bool:
         "biaya service",
         "harga servis",
         "harga service",
+        "estimasi biaya",
+        "perkiraan biaya",
     )
-    return any(marker in low for marker in markers)
+    if any(marker in low for marker in generic_markers):
+        return "overview"
+
+    return None
+
+
+def _looks_like_price_question(text: str) -> bool:
+    return _price_question_kind(text) is not None
 
 
 async def price_answer(
@@ -192,43 +289,106 @@ async def price_answer(
     label = _context_label(context_items)
     lookup_text = " ".join(x for x in (text, context) if x)
     code = detect_skill_code(lookup_text)
+    kind = _price_question_kind(text) or "overview"
 
     subject = f"Untuk *{label}*, " if label else "Untuk service mesin, "
 
+    if kind == "booking":
+        return (
+            subject
+            + "booking dihitung dari jarak lokasi, bukan dari tingkat kerusakan. "
+            + f"Tarif booking saat ini: {booking_tier_text()}\n\n"
+            + "Booking yang sudah dibayar menjadi kredit/pengurang jasa jika "
+            + "perbaikan berhasil. Spare part tetap dihitung terpisah."
+        )
+
+    if kind == "sparepart":
+        return (
+            subject
+            + "spare part belum termasuk dalam booking atau nominal jasa yang saya tampilkan. "
+            + "Kalau setelah diagnosis ada komponen yang perlu diganti, kebutuhan dan nilainya "
+            + "harus dikonfirmasi terlebih dahulu sebelum pekerjaan dilanjutkan."
+        )
+
+    if kind == "not_repaired":
+        return (
+            subject
+            + "kalau setelah pengecekan pekerjaan tidak dilanjutkan ke perbaikan, "
+            + "biaya akhirnya harus mengikuti hasil diagnosis dan status transaksi pada order. "
+            + "Saya tidak akan menebak nominal potongan atau pengembalian sebelum hasilnya tercatat."
+        )
+
+    row = None
+    if code:
+        async with pool().acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM service_price_matrix WHERE skill_code=$1",
+                code,
+            )
+
+    if kind in {"inspection", "light", "medium", "heavy"}:
+        labels = {
+            "inspection": ("pengecekan", "inspection_fee"),
+            "light": ("ringan", "light_fee"),
+            "medium": ("sedang", "medium_fee"),
+            "heavy": ("berat", "heavy_fee"),
+        }
+        tier_name, column = labels[kind]
+
+        if not code:
+            return (
+                f"Untuk kategori *{tier_name}*, saya perlu tahu jenis mesinnya dulu "
+                "supaya tidak mengambil matrix tarif yang salah."
+            )
+
+        if not row:
+            return (
+                f"Untuk kategori *{tier_name}* pada {label or 'mesin tersebut'}, "
+                "nominal detailnya belum tersedia di matrix. "
+                "Kategori dan biaya final tetap dikonfirmasi setelah diagnosis mekanik."
+            )
+
+        amount = int(row[column] or 0)
+        if not amount:
+            return (
+                f"Untuk *{row['skill_name']}* kategori *{tier_name}*, "
+                "nominalnya belum dikunci di matrix dan masih memerlukan quotation setelah diagnosis."
+            )
+
+        return (
+            f"Untuk *{row['skill_name']}* kategori *{tier_name}*, "
+            f"acuan matrix saat ini *{rupiah(amount)}*. "
+            "Kategori ringan/sedang/berat baru dipastikan setelah mekanik melakukan diagnosis. "
+            "Spare part, bila diperlukan, dihitung terpisah."
+        )
+
     base = (
         subject
-        + "biaya kunjungan mengikuti jarak lokasi. "
+        + "biaya awal yang bisa dipastikan adalah booking berdasarkan jarak lokasi. "
         + f"Tarif booking saat ini: {booking_tier_text()}\n\n"
-        + "Biaya jasa perbaikan final ditentukan dari jenis mesin dan tingkat "
-        + "kesulitan setelah mekanik melakukan diagnosis. "
-        + "Booking yang sudah dibayar menjadi kredit/pengurang jasa jika "
-        + "perbaikan berhasil; spare part dihitung terpisah dan dikonfirmasi terlebih dahulu."
+        + "Untuk jasa perbaikan, nilainya mengikuti jenis mesin dan tingkat kesulitan "
+        + "setelah diagnosis. Booking yang sudah dibayar menjadi pengurang jasa jika "
+        + "perbaikan berhasil; spare part dihitung terpisah."
     )
 
     if not code:
         if context_items:
             return (
                 base
-                + "\n\nUntuk data mesin yang sudah Anda sampaikan, "
-                + "tarif jasa detail akan mengikuti hasil diagnosis mekanik."
+                + "\n\nUntuk mesin yang sudah Anda jelaskan, saya belum menemukan matrix "
+                + "yang cukup spesifik untuk memberi nominal jasa tanpa diagnosis."
             )
 
         return (
             base
-            + "\n\nKalau Anda sebutkan jenis mesin dan keluhannya, "
-            + "saya bisa cek apakah matrix tarifnya sudah tersedia."
-        )
-
-    async with pool().acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM service_price_matrix WHERE skill_code=$1",
-            code,
+            + "\n\nSebutkan jenis mesin dan keluhannya kalau Anda ingin saya cek "
+            + "apakah matrix tarif detailnya sudah tersedia."
         )
 
     if not row:
         return (
             base
-            + "\n\nTarif jasa detail untuk kategori ini belum tersedia di matrix "
+            + "\n\nTarif jasa detail untuk kategori mesin ini belum tersedia di matrix "
             + "dan akan dikonfirmasi setelah diagnosis mekanik."
         )
 
@@ -506,6 +666,277 @@ async def customer_status_summary(order_no: str) -> str:
     return "\n\n".join(lines)
 
 
+
+def _interruption_context_items(payload: dict) -> list[dict]:
+    items = list(_context_items_from_payload(payload))
+    current_machine = str(payload.get("current_machine") or "").strip()
+
+    if current_machine:
+        existing = {
+            str(
+                item.get("machine")
+                or item.get("machine_text")
+                or ""
+            ).strip().lower()
+            for item in items
+            if isinstance(item, dict)
+        }
+        if current_machine.lower() not in existing:
+            items.append({"machine": current_machine, "problem": ""})
+
+    return items
+
+
+def _state_resume_prompt(state: str, payload: dict) -> str:
+    if state == "cust_name":
+        return "Kalau sudah jelas, boleh sebutkan nama Anda atau nama perusahaan?"
+
+    if state == "cust_machine_count":
+        return "Lalu, ada berapa unit mesin yang ingin dicek?"
+
+    if state == "cust_machine_desc":
+        idx = int(payload.get("machine_index") or 1)
+        return f"Untuk lanjut, mesin ke-{idx} jenis/merk/modelnya apa?"
+
+    if state == "cust_machine_problem":
+        machine = str(payload.get("current_machine") or "mesin tersebut").strip()
+        return f"Untuk lanjut, apa keluhan pada *{machine}*?"
+
+    if state == "cust_location":
+        return "Untuk lanjut mencari mekanik terdekat, silakan kirim *Share Location* lokasi mesin."
+
+    if state == "cust_location_confirm":
+        return "Kalau titik lokasi tadi sudah benar, jawab *iya* atau *betul*. Kalau salah, kirim Share Location ulang."
+
+    if state == "cust_media":
+        try:
+            item_no = int(payload.get("media_item_no") or 1)
+        except (TypeError, ValueError):
+            item_no = 1
+        machine = _media_machine_label(payload, item_no)
+        return (
+            f"Kalau ada, silakan lanjut kirim foto/video *{machine}*. "
+            "Kalau tidak ada, ketik *LEWATI*."
+        )
+
+    if state == "cust_landmark":
+        return "Kalau ada, sebutkan patokan lokasinya. Kalau tidak ada, cukup jawab *cukup* atau *tidak ada*."
+
+    if state == "cust_price_context":
+        return "Kalau ingin dilanjutkan menjadi permintaan service, tinggal bilang *lanjut* atau *carikan mekanik*."
+
+    if state == "cust_update_location":
+        return "Untuk melanjutkan perubahan lokasi, kirim *Share Location* yang baru."
+
+    return ""
+
+
+def _side_question_topic(text: str) -> str | None:
+    low = _normalize_customer_text(text)
+    if not low:
+        return None
+
+    if _looks_like_price_question(text):
+        return "price"
+
+    if "garansi" in low or "warranty" in low:
+        return "warranty"
+
+    if any(
+        marker in low
+        for marker in (
+            "cara bayar",
+            "cara pembayaran",
+            "bayarnya gimana",
+            "bayar gimana",
+            "transfer kemana",
+            "transfer ke mana",
+            "bisa cash",
+            "bisa tunai",
+            "bisa qris",
+            "pembayaran bagaimana",
+        )
+    ):
+        return "payment"
+
+    if any(
+        marker in low
+        for marker in (
+            "mekaniknya dari mana",
+            "teknisinya dari mana",
+            "mekanik dari mana",
+            "teknisi dari mana",
+            "mekanik mana",
+            "teknisi mana",
+            "lokasi mekanik",
+            "lokasi teknisi",
+        )
+    ):
+        return "mechanic_origin"
+
+    if any(
+        marker in low
+        for marker in (
+            "bisa datang",
+            "bisa hari",
+            "datang kapan",
+            "kapan datang",
+            "kapan mekanik",
+            "kapan teknisi",
+            "jadwal mekanik",
+            "jadwal teknisi",
+            "jam berapa datang",
+            "datang jam berapa",
+            "datang sore",
+            "datang pagi",
+            "datang malam",
+            "datang siang",
+            "hari minggu",
+            "hari sabtu",
+            "besok bisa",
+            "hari ini bisa",
+            "maunya sore",
+            "maunya pagi",
+            "maunya malam",
+        )
+    ):
+        return "schedule"
+
+    if any(
+        marker in low
+        for marker in (
+            "berapa lama",
+            "lama perbaikan",
+            "lama servis",
+            "lama service",
+            "selesai berapa lama",
+        )
+    ):
+        return "duration"
+
+    if any(
+        marker in low
+        for marker in (
+            "daerah saya ada mekanik",
+            "daerah saya ada teknisi",
+            "bisa ke daerah",
+            "bisa ke lokasi saya",
+            "jangkau daerah",
+            "jangkau lokasi",
+        )
+    ):
+        return "coverage"
+
+    if _looks_like_question(text):
+        return "general"
+
+    return None
+
+
+def _append_resume(answer: str, resume: str) -> str:
+    answer = (answer or "").strip()
+    resume = (resume or "").strip()
+
+    if not resume:
+        return answer
+    if not answer:
+        return resume
+    return answer + "\n\n" + resume
+
+
+async def _answer_side_question(
+    msg: IncomingMessage,
+    state: str,
+    payload: dict,
+    analysis: dict | None = None,
+    context_items: list[dict] | None = None,
+) -> str | None:
+    text = (msg.text or "").strip()
+    if not text:
+        return None
+
+    analysis = analysis or {}
+    resume = _state_resume_prompt(state, payload)
+    context_items = list(context_items or _interruption_context_items(payload))
+
+    if (
+        _looks_like_price_question(text)
+        or analysis.get("intent") == "PRICE_QUESTION"
+    ):
+        answer = await price_answer(text, context_items)
+        return _append_resume(answer, resume)
+
+    if analysis.get("control") == "GREETING":
+        return _append_resume("Halo.", resume)
+
+    topic = _side_question_topic(text)
+
+    if analysis.get("intent") == "STATUS_QUESTION":
+        active = await active_order_for_customer(msg.phone)
+        if active:
+            answer = await customer_status_summary(active["order_no"])
+        else:
+            answer = (
+                "Untuk proses yang sedang kita isi ini belum ada nomor service, "
+                "jadi belum ada status matching mekanik yang bisa dicek."
+            )
+        return _append_resume(answer, resume)
+
+    if topic == "schedule":
+        answer = (
+            "Waktu kedatangan belum bisa saya janjikan sebelum ada mekanik yang menerima job. "
+            "Setelah ada mekanik yang cocok dan merespons, jadwal kedatangan bisa dikonfirmasi "
+            "berdasarkan ketersediaannya."
+        )
+        return _append_resume(answer, resume)
+
+    if topic == "mechanic_origin":
+        answer = (
+            "Sistem mencari mekanik aktif yang skill-nya sesuai dan masih dalam radius dari lokasi mesin. "
+            "Nama serta jaraknya baru bisa ditampilkan setelah ada kandidat yang merespons."
+        )
+        return _append_resume(answer, resume)
+
+    if topic == "warranty":
+        answer = (
+            "Ketentuan garansi tidak saya tetapkan sebelum jenis pekerjaan diketahui. "
+            "Setelah diagnosis dan pekerjaan disepakati, garansi jasa atau spare part perlu "
+            "mengikuti pekerjaan yang benar-benar dilakukan."
+        )
+        return _append_resume(answer, resume)
+
+    if topic == "payment":
+        answer = (
+            "Instruksi pembayaran diberikan pada tahap transaksi yang sesuai. "
+            "Sebaiknya jangan transfer sebelum ada instruksi resmi pada order. "
+            "Booking dihitung dari jarak dan menjadi pengurang jasa jika perbaikan berhasil."
+        )
+        return _append_resume(answer, resume)
+
+    if topic == "duration":
+        answer = (
+            "Lama perbaikan belum bisa dipastikan sebelum mekanik melakukan diagnosis. "
+            "Setelah kondisi mesin diketahui, estimasi pekerjaan bisa dijelaskan sebelum dilanjutkan."
+        )
+        return _append_resume(answer, resume)
+
+    if topic == "coverage":
+        answer = (
+            "Untuk memastikan ada mekanik yang bisa menjangkau lokasi Anda, saya perlu titik *Share Location*. "
+            "Sistem mencocokkan skill, radius layanan, dan jarak mekanik dari lokasi mesin."
+        )
+        return _append_resume(answer, resume)
+
+    if (
+        topic == "general"
+        or analysis.get("intent") in {"GENERAL_QUESTION", "UNKNOWN"}
+    ):
+        answer = await conversational_customer_reply(text)
+        return _append_resume(answer, resume)
+
+    return None
+
+
 async def _apply_machine_count(
     phone: str,
     payload: dict,
@@ -700,7 +1131,7 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
     if st == "cust_price_context":
         analysis = await understand()
-        low = re.sub(r"\s+", " ", text.lower()).strip()
+        low = _normalize_customer_text(text)
 
         continue_markers = (
             "kirim mekanik",
@@ -738,7 +1169,10 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             await clear_state(msg.phone)
             return await _start_intake(msg, classified)
 
-        if analysis.get("intent") == "PRICE_QUESTION":
+        if (
+            _looks_like_price_question(text)
+            or analysis.get("intent") == "PRICE_QUESTION"
+        ):
             machines = _machines_from_ai(analysis)
             if machines:
                 payload["prefill_machines"] = machines
@@ -755,10 +1189,21 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 "Kalau ingin saya carikan mekanik, tinggal bilang lanjut."
             )
 
+        side = await _answer_side_question(
+            msg,
+            st,
+            payload,
+            analysis,
+        )
+        if side is not None:
+            return side
+
         return await conversational_customer_reply(text)
 
     if st == "cust_name":
-        if quick.get("control") == "GREETING":
+        analysis = await understand() if text else {}
+
+        if quick.get("control") == "GREETING" or analysis.get("control") == "GREETING":
             return (
                 "Halo. Sebelum melanjutkan pencarian mekanik, "
                 "boleh tahu nama Anda atau nama perusahaan?"
@@ -767,10 +1212,19 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         if len(text) < 2:
             return "Boleh sebutkan nama Anda atau nama perusahaan?"
 
-        analysis = await understand()
-        name = (analysis.get("fields") or {}).get("name")
+        fields = analysis.get("fields") or {}
+        name = str(fields.get("name") or "").strip()
 
         if not name:
+            side = await _answer_side_question(
+                msg,
+                st,
+                payload,
+                analysis,
+            )
+            if side is not None:
+                return side
+
             name = re.sub(
                 r"(?i)^\s*(?:nama\s+(?:saya|aku)\s*[:=-]?\s*|"
                 r"saya\s+|aku\s+|jenengku\s*[:=-]?\s*|"
@@ -791,18 +1245,30 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         pending = payload.pop("pending_machine_count", None)
         if pending:
-            return await _apply_machine_count(
+            next_prompt = await _apply_machine_count(
                 msg.phone,
                 payload,
                 int(pending),
                 payload.get("prefill_machines"),
             )
+        else:
+            await set_state(msg.phone, "cust_machine_count", payload)
+            next_prompt = (
+                f"Terima kasih, {name}. Ada berapa mesin yang ingin dicek? "
+                "Boleh jawab *satu*, *2 unit*, *loro mesin*, dan sebagainya."
+            )
 
-        await set_state(msg.phone, "cust_machine_count", payload)
-        return (
-            f"Terima kasih, {name}. Ada berapa mesin yang ingin dicek? "
-            "Boleh jawab *satu*, *2 unit*, *loro mesin*, dan sebagainya."
-        )
+        if (
+            _looks_like_price_question(text)
+            or analysis.get("intent") == "PRICE_QUESTION"
+        ):
+            answer = await price_answer(
+                text,
+                _interruption_context_items(payload),
+            )
+            return _append_resume(answer, next_prompt)
+
+        return next_prompt
 
     if st == "cust_machine_count":
         bulk = parse_bulk_machine_list(text)
@@ -817,50 +1283,63 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             )
 
         count = quick.get("machine_count")
-        analysis = None
-
+        analysis = await understand() if text else {}
         if count is None:
-            analysis = await understand()
-
-            if analysis.get("intent") == "PRICE_QUESTION":
-                answer = await price_answer(
-                    text,
-                    _context_items_from_payload(payload),
-                )
-                return (
-                    answer
-                    + "\n\nUntuk melanjutkan pencarian mekanik, ada berapa mesin yang ingin dicek?"
-                )
-
-            if analysis.get("control") == "GREETING":
-                return (
-                    "Halo. Saya masih membantu proses service Anda. "
-                    "Saya perlu tahu jumlah mesinnya; misalnya *satu*, "
-                    "*2 unit*, atau *loro mesin*."
-                )
-
             count = analysis.get("machine_count")
 
-        if count is None:
-            return (
-                "Saya paham Anda sedang membutuhkan service. "
-                "Ada berapa mesin yang akan dicek? Tidak harus pakai angka; "
-                "boleh jawab *cuma satu*, *mung siji*, *kalih unit*, dan sebagainya."
+        if (
+            _looks_like_price_question(text)
+            or analysis.get("intent") == "PRICE_QUESTION"
+        ):
+            answer = await price_answer(
+                text,
+                _context_items_from_payload(payload),
             )
 
-        extra_machines = []
-        if analysis:
+            if count is not None:
+                extra_machines = list(analysis.get("machines") or [])
+                prefill = list(payload.get("prefill_machines") or [])
+                if extra_machines:
+                    prefill = extra_machines
+
+                next_prompt = await _apply_machine_count(
+                    msg.phone,
+                    payload,
+                    int(count),
+                    prefill,
+                )
+                return _append_resume(answer, next_prompt)
+
+            return _append_resume(
+                answer,
+                "Untuk melanjutkan pencarian mekanik, ada berapa mesin yang ingin dicek?",
+            )
+
+        if count is not None:
             extra_machines = list(analysis.get("machines") or [])
+            prefill = list(payload.get("prefill_machines") or [])
+            if extra_machines:
+                prefill = extra_machines
 
-        prefill = list(payload.get("prefill_machines") or [])
-        if extra_machines:
-            prefill = extra_machines or prefill
+            return await _apply_machine_count(
+                msg.phone,
+                payload,
+                int(count),
+                prefill,
+            )
 
-        return await _apply_machine_count(
-            msg.phone,
+        side = await _answer_side_question(
+            msg,
+            st,
             payload,
-            int(count),
-            prefill,
+            analysis,
+        )
+        if side is not None:
+            return side
+
+        return (
+            "Saya masih perlu jumlah mesinnya. Tidak harus pakai angka; "
+            "boleh jawab *cuma satu*, *mung siji*, *kalih unit*, dan sebagainya."
         )
 
     if st == "cust_machine_desc":
@@ -868,54 +1347,105 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             return "Sebutkan yang Anda tahu tentang mesinnya, misalnya merek, jenis, atau model."
 
         analysis = await understand()
+        fields = analysis.get("fields") or {}
+        machines = analysis.get("machines") or []
+        machine = str(fields.get("machine_description") or "").strip()
+        problem = str(fields.get("problem") or "").strip()
 
-        if analysis.get("intent") == "PRICE_QUESTION":
-            answer = await price_answer(
-                text,
-                _context_items_from_payload(payload),
-            )
-            return (
-                answer
-                + "\n\nUntuk melanjutkan, mesin yang dimaksud jenis/merk/modelnya apa?"
+        if machines:
+            machine = machine or str(machines[0].get("machine") or "").strip()
+            problem = problem or str(machines[0].get("problem") or "").strip()
+
+        if (
+            _looks_like_price_question(text)
+            or analysis.get("intent") == "PRICE_QUESTION"
+        ):
+            price_context = _interruption_context_items(payload)
+            if machine or problem:
+                price_context.append({"machine": machine, "problem": problem})
+
+            answer = await price_answer(text, price_context)
+
+            if machine and problem:
+                next_prompt = await _finish_machine_item(
+                    msg.phone,
+                    payload,
+                    machine,
+                    problem,
+                )
+                return _append_resume(answer, next_prompt)
+
+            if machine:
+                payload["current_machine"] = machine[:300]
+                await set_state(msg.phone, "cust_machine_problem", payload)
+                next_prompt = f"Saya juga catat mesinnya *{machine}*. Keluhannya bagaimana?"
+                return _append_resume(answer, next_prompt)
+
+            return _append_resume(
+                answer,
+                _state_resume_prompt(st, payload),
             )
 
         if analysis.get("control") == "GREETING":
             return "Halo. Kita lanjut ya. Mesin yang bermasalah jenis/merk/modelnya apa?"
 
-        fields = analysis.get("fields") or {}
-        machines = analysis.get("machines") or []
-        machine = fields.get("machine_description")
-        problem = fields.get("problem")
-
-        if machines:
-            machine = machine or machines[0].get("machine")
-            problem = problem or machines[0].get("problem")
-
-        if not machine:
-            normalized = (analysis.get("normalized_text") or "").lower()
-            if any(x in normalized for x in ("tidak tahu", "tidak mengetahui")):
-                return (
-                    "Tidak masalah kalau tidak tahu modelnya. "
-                    "Sebutkan yang diketahui saja, misalnya *Juki*, *obras*, "
-                    "*jarum 1*, atau mereknya saja."
-                )
-            if analysis.get("requires_clarification"):
-                return "Saya belum yakin jenis mesinnya. Boleh sebutkan merek/jenis yang Anda tahu?"
-            machine = text[:300]
-
-        if problem:
-            return await _finish_machine_item(
-                msg.phone,
+        strong_topic = _side_question_topic(text)
+        if strong_topic in {
+            "schedule",
+            "mechanic_origin",
+            "warranty",
+            "payment",
+            "duration",
+            "coverage",
+        }:
+            side = await _answer_side_question(
+                msg,
+                st,
                 payload,
-                machine,
-                problem,
+                analysis,
+            )
+            if side is not None:
+                return side
+
+        if machine:
+            if problem:
+                return await _finish_machine_item(
+                    msg.phone,
+                    payload,
+                    machine,
+                    problem,
+                )
+
+            payload["current_machine"] = machine[:300]
+            await set_state(msg.phone, "cust_machine_problem", payload)
+            return (
+                f"Baik, saya catat *{machine}*. "
+                "Keluhannya bagaimana? Ceritakan saja dengan bahasa sehari-hari."
             )
 
-        payload["current_machine"] = machine[:300]
-        await set_state(msg.phone, "cust_machine_problem", payload)
+        side = await _answer_side_question(
+            msg,
+            st,
+            payload,
+            analysis,
+        )
+        if side is not None:
+            return side
+
+        normalized = str(analysis.get("normalized_text") or "").lower()
+        if any(x in normalized for x in ("tidak tahu", "tidak mengetahui")):
+            return (
+                "Tidak masalah kalau tidak tahu modelnya. "
+                "Sebutkan yang diketahui saja, misalnya *Juki*, *obras*, "
+                "*jarum 1*, atau mereknya saja."
+            )
+
+        if analysis.get("requires_clarification"):
+            return "Saya belum yakin jenis mesinnya. Boleh sebutkan merek/jenis yang Anda tahu?"
+
         return (
-            f"Baik, saya catat *{machine}*. "
-            "Keluhannya bagaimana? Ceritakan saja dengan bahasa sehari-hari."
+            "Saya belum menangkap jenis mesinnya. "
+            "Sebutkan yang Anda tahu saja, misalnya merek, jenis, atau model."
         )
 
     if st == "cust_machine_problem":
@@ -926,65 +1456,115 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             )
 
         analysis = await understand()
+        fields = analysis.get("fields") or {}
+        machines = analysis.get("machines") or []
+        problem = str(fields.get("problem") or "").strip()
 
-        if analysis.get("intent") == "PRICE_QUESTION":
-            items = _context_items_from_payload(payload)
-            current_machine = str(payload.get("current_machine") or "").strip()
-            if current_machine:
-                items = list(items) + [{"machine": current_machine, "problem": ""}]
+        if not problem and machines:
+            problem = str(machines[0].get("problem") or "").strip()
 
-            answer = await price_answer(text, items)
-            return (
-                answer
-                + "\n\nUntuk membantu diagnosis awal, "
-                f"apa keluhan pada *{payload.get('current_machine', 'mesin tersebut')}*?"
+        current_machine = str(payload.get("current_machine") or "").strip()
+
+        if (
+            _looks_like_price_question(text)
+            or analysis.get("intent") == "PRICE_QUESTION"
+        ):
+            price_context = _interruption_context_items(payload)
+            if current_machine and problem:
+                price_context = [
+                    item
+                    for item in price_context
+                    if str(item.get("machine") or "").strip().lower()
+                    != current_machine.lower()
+                ]
+                price_context.append({"machine": current_machine, "problem": problem})
+
+            answer = await price_answer(text, price_context)
+
+            if problem:
+                next_prompt = await _finish_machine_item(
+                    msg.phone,
+                    payload,
+                    current_machine,
+                    problem,
+                )
+                return _append_resume(answer, next_prompt)
+
+            return _append_resume(
+                answer,
+                _state_resume_prompt(st, payload),
             )
 
         if analysis.get("control") == "GREETING":
             return (
                 "Halo. Kita lanjut ya. "
-                f"Apa keluhan pada *{payload.get('current_machine', 'mesin tersebut')}*?"
+                f"Apa keluhan pada *{current_machine or 'mesin tersebut'}*?"
             )
 
-        fields = analysis.get("fields") or {}
-        machines = analysis.get("machines") or []
-        problem = fields.get("problem")
+        strong_topic = _side_question_topic(text)
+        if strong_topic in {
+            "schedule",
+            "mechanic_origin",
+            "warranty",
+            "payment",
+            "duration",
+            "coverage",
+        }:
+            side = await _answer_side_question(
+                msg,
+                st,
+                payload,
+                analysis,
+            )
+            if side is not None:
+                return side
 
-        if not problem and machines:
-            problem = machines[0].get("problem")
+        if problem:
+            return await _finish_machine_item(
+                msg.phone,
+                payload,
+                current_machine,
+                problem,
+            )
 
-        if not problem:
-            normalized = (analysis.get("normalized_text") or "").lower()
-            if "tidak tahu" in normalized:
-                return (
-                    "Tidak masalah kalau belum tahu penyebabnya. "
-                    "Ceritakan gejala yang terlihat atau terdengar saja."
-                )
-            if analysis.get("requires_clarification"):
-                return (
-                    "Saya belum yakin menangkap keluhannya. "
-                    "Boleh ceritakan lagi gejalanya dengan singkat?"
-                )
-            problem = text[:1500]
-
-        return await _finish_machine_item(
-            msg.phone,
+        side = await _answer_side_question(
+            msg,
+            st,
             payload,
-            payload["current_machine"],
-            problem,
+            analysis,
+        )
+        if side is not None:
+            return side
+
+        normalized = str(analysis.get("normalized_text") or "").lower()
+        if "tidak tahu" in normalized:
+            return (
+                "Tidak masalah kalau belum tahu penyebabnya. "
+                "Ceritakan gejala yang terlihat atau terdengar saja."
+            )
+
+        if analysis.get("requires_clarification"):
+            return (
+                "Saya belum yakin menangkap keluhannya. "
+                "Boleh ceritakan lagi gejalanya dengan singkat?"
+            )
+
+        return (
+            "Saya belum menangkap gejala kerusakannya. "
+            f"Boleh ceritakan apa yang terjadi pada *{current_machine or 'mesin tersebut'}*?"
         )
 
     if st == "cust_location":
         if not msg.location:
-            if text and _looks_like_price_question(text):
-                answer = await price_answer(
-                    text,
-                    _context_items_from_payload(payload),
-                )
-                return (
-                    answer
-                    + "\n\nUntuk melanjutkan pencarian mekanik, silakan kirim *Share Location* lokasi mesin."
-                )
+            analysis = await understand() if text else {}
+            side = await _answer_side_question(
+                msg,
+                st,
+                payload,
+                analysis,
+            )
+            if side is not None:
+                return side
 
             if text:
                 return (
@@ -1011,17 +1591,8 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 "Apakah titik ini sudah benar?"
             )
 
-        if text and _looks_like_price_question(text):
-            answer = await price_answer(
-                text,
-                _context_items_from_payload(payload),
-            )
-            return (
-                answer
-                + "\n\nKalau titik lokasi tadi sudah sesuai, jawab *iya*, *bener*, *nggih*, atau *betul*."
-            )
-
         control = quick.get("control")
+        analysis = None
         if control not in {"YES", "NO"} and text:
             analysis = await understand()
             control = analysis.get("control")
@@ -1031,6 +1602,18 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         if control == "NO":
             return "Baik, berarti titik tadi belum benar. Silakan kirim *Share Location* yang benar."
+
+        if text:
+            if analysis is None:
+                analysis = await understand()
+            side = await _answer_side_question(
+                msg,
+                st,
+                payload,
+                analysis,
+            )
+            if side is not None:
+                return side
 
         return (
             "Saya perlu memastikan titiknya benar. "
@@ -1107,7 +1690,7 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 "Kalau tidak ada, ketik *LEWATI*."
             )
 
-        low = re.sub(r"\s+", " ", text.lower()).strip()
+        low = _normalize_customer_text(text)
         finished = {
             "selesai",
             "sudah",
@@ -1135,23 +1718,16 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         if low in finished:
             return await _advance_customer_media(msg.phone, payload)
 
-        # Pertanyaan sampingan boleh dijawab tanpa menghilangkan state media.
-        if _looks_like_price_question(text):
-            answer = await price_answer(text, items)
-            return (
-                answer
-                + f"\n\nKalau ada, silakan lanjut kirim foto/video *{machine}*. "
-                "Kalau tidak ada, ketik *LEWATI*."
-            )
-
         analysis = await understand() if text else {}
-        if analysis.get("intent") == "PRICE_QUESTION":
-            answer = await price_answer(text, items)
-            return (
-                answer
-                + f"\n\nKalau ada, silakan lanjut kirim foto/video *{machine}*. "
-                "Kalau tidak ada, ketik *LEWATI*."
-            )
+        side = await _answer_side_question(
+            msg,
+            st,
+            payload,
+            analysis,
+            context_items=items,
+        )
+        if side is not None:
+            return side
 
         return (
             f"Sekarang saya masih menunggu foto atau video kondisi *{machine}*. "
@@ -1159,18 +1735,8 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         )
 
     if st == "cust_landmark":
-        if text and _looks_like_price_question(text):
-            answer = await price_answer(
-                text,
-                _context_items_from_payload(payload),
-            )
-            return (
-                answer
-                + "\n\nKalau tidak ada patokan tambahan, cukup jawab *tidak ada* atau *cukup*."
-            )
-
         control = quick.get("control")
-        low_landmark = re.sub(r"\s+", " ", text.lower()).strip()
+        low_landmark = _normalize_customer_text(text)
 
         no_landmark_words = (
             "tidak ada",
@@ -1203,7 +1769,47 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             ))
         )
 
-        landmark = "" if no_landmark else text[:500]
+        analysis = await understand() if text and not no_landmark else {}
+        landmark_from_ai = str((analysis.get("fields") or {}).get("landmark") or "").strip()
+
+        strong_topic = _side_question_topic(text) if not no_landmark else None
+        if (
+            strong_topic in {
+                "price",
+                "schedule",
+                "mechanic_origin",
+                "warranty",
+                "payment",
+                "duration",
+                "coverage",
+            }
+            or analysis.get("intent") == "STATUS_QUESTION"
+        ):
+            side = await _answer_side_question(
+                msg,
+                st,
+                payload,
+                analysis,
+            )
+            if side is not None:
+                return side
+
+        if not no_landmark and not landmark_from_ai:
+            side = await _answer_side_question(
+                msg,
+                st,
+                payload,
+                analysis,
+            )
+            if side is not None:
+                return side
+
+        if no_landmark:
+            landmark = ""
+        elif landmark_from_ai:
+            landmark = landmark_from_ai[:500]
+        else:
+            landmark = text[:500]
 
         customer = await get_or_create_customer(msg.phone)
         items = payload.get("items") or []
@@ -1243,6 +1849,15 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
     if st == "cust_update_location":
         order_no = payload.get("order_no")
         if not msg.location:
+            analysis = await understand() if text else {}
+            side = await _answer_side_question(
+                msg,
+                st,
+                payload,
+                analysis,
+            )
+            if side is not None:
+                return side
             return "Silakan kirim *Share Location* baru untuk lokasi mesin."
 
         order = await find_order(order_no)
@@ -1398,7 +2013,10 @@ async def handle_customer_message(msg: IncomingMessage) -> str:
 
     classified = await classify_customer_message(text)
 
-    if classified["intent"] == "PRICE_QUESTION":
+    if (
+        _looks_like_price_question(text)
+        or classified["intent"] == "PRICE_QUESTION"
+    ):
         await _remember_price_service_context(msg, classified)
 
         context_items = _machines_from_ai(classified)
