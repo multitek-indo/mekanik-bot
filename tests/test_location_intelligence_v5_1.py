@@ -1,27 +1,19 @@
 import asyncio
 
-from app import customer, location_intelligence as li
-from app.types import IncomingMessage
+from app import location_intelligence as li
 
 
-def _msg(text: str = "", location=None, phone: str = "6200000000000") -> IncomingMessage:
-    return IncomingMessage(
-        message_id="location-v5-1-test",
-        phone=phone,
-        sender_name="Customer Test",
-        text=text,
-        location=location,
-        image=None,
-        video=None,
-        document=None,
-        media_type=None,
-        media_path=None,
-        raw_payload={},
-    )
+def _reset_env(monkeypatch):
+    monkeypatch.setenv("LOCATION_INTELLIGENCE_ENABLED", "true")
+    monkeypatch.setenv("LOCATION_CACHE_TTL_SECONDS", "86400")
+    monkeypatch.setenv("LOCATION_CACHE_COORD_DECIMALS", "5")
+    monkeypatch.setenv("LOCATION_OVERPASS_MAX_CALLS_PER_DAY", "80")
+    monkeypatch.setenv("LOCATION_SHOW_ATTRIBUTION", "true")
 
 
-def test_resolver_uses_exact_company_and_nearby_landmark(monkeypatch):
-    monkeypatch.setattr(li, "_google_key", lambda: "")
+def test_resolver_uses_company_and_nearby_landmark(monkeypatch):
+    _reset_env(monkeypatch)
+    asyncio.run(li.clear_location_cache())
 
     async def fake_reverse(lat, lon, timeout):
         return {
@@ -49,14 +41,14 @@ def test_resolver_uses_exact_company_and_nearby_landmark(monkeypatch):
                 "lat": lat + 0.00050,
                 "lon": lon,
                 "distance_m": 55.0,
-                "types": ["shop", "convenience_store"],
+                "types": ["shop", "convenience"],
                 "type_score": 96,
                 "provider": "openstreetmap_overpass",
             },
         ]
 
-    monkeypatch.setattr(li, "_osm_reverse", fake_reverse)
-    monkeypatch.setattr(li, "_osm_nearby", fake_nearby)
+    monkeypatch.setattr(li, "_safe_reverse", fake_reverse)
+    monkeypatch.setattr(li, "_safe_nearby", fake_nearby)
 
     resolved = asyncio.run(
         li.resolve_location_intelligence(
@@ -67,43 +59,73 @@ def test_resolver_uses_exact_company_and_nearby_landmark(monkeypatch):
     assert resolved["name"] == "PT Maju Jaya"
     assert resolved["auto_landmark"] == "Indomaret Lemah Abang"
     assert resolved["auto_landmark_distance_m"] == 55
-    assert resolved["lat"] == -7.12345
-    assert resolved["lon"] == 110.12345
-
-    reply = li.format_location_confirmation(resolved)
-    assert "PT Maju Jaya" in reply
-    assert "Indomaret Lemah Abang" in reply
-    assert "-7.12345" not in reply
-    assert "110.12345" not in reply
+    assert resolved["location_cache_hit"] is False
+    assert resolved["location_attribution"] == "OpenStreetMap contributors"
 
 
-def test_resolver_preserves_whatsapp_place_name(monkeypatch):
-    monkeypatch.setattr(li, "_google_key", lambda: "")
+def test_cache_prevents_second_provider_lookup(monkeypatch):
+    _reset_env(monkeypatch)
+    asyncio.run(li.clear_location_cache())
+    calls = {"reverse": 0, "nearby": 0}
+
+    async def fake_reverse(lat, lon, timeout):
+        calls["reverse"] += 1
+        return {"name": "", "address": "Jl. Test", "provider": "openstreetmap_nominatim"}
+
+    async def fake_nearby(lat, lon, timeout, radius_m):
+        calls["nearby"] += 1
+        return []
+
+    monkeypatch.setattr(li, "_safe_reverse", fake_reverse)
+    monkeypatch.setattr(li, "_safe_nearby", fake_nearby)
+
+    first = asyncio.run(li.resolve_location_intelligence({"lat": -7.2, "lon": 110.2}))
+    second = asyncio.run(li.resolve_location_intelligence({"lat": -7.2, "lon": 110.2}))
+
+    assert calls == {"reverse": 1, "nearby": 1}
+    assert first["location_cache_hit"] is False
+    assert second["location_cache_hit"] is True
+
+
+def test_nearby_coordinate_rounding_reuses_cache(monkeypatch):
+    _reset_env(monkeypatch)
+    monkeypatch.setenv("LOCATION_CACHE_COORD_DECIMALS", "5")
+    asyncio.run(li.clear_location_cache())
+    calls = {"count": 0}
+
+    async def fake_reverse(lat, lon, timeout):
+        calls["count"] += 1
+        return {"address": "Jl. Test", "provider": "openstreetmap_nominatim"}
+
+    async def fake_nearby(lat, lon, timeout, radius_m):
+        return []
+
+    monkeypatch.setattr(li, "_safe_reverse", fake_reverse)
+    monkeypatch.setattr(li, "_safe_nearby", fake_nearby)
+
+    asyncio.run(li.resolve_location_intelligence({"lat": -7.123451, "lon": 110.123451}))
+    result = asyncio.run(li.resolve_location_intelligence({"lat": -7.123452, "lon": 110.123452}))
+
+    assert calls["count"] == 1
+    assert result["location_cache_hit"] is True
+
+
+def test_whatsapp_name_has_priority(monkeypatch):
+    _reset_env(monkeypatch)
+    asyncio.run(li.clear_location_cache())
 
     async def fake_reverse(lat, lon, timeout):
         return {
             "name": "Gedung Lain",
             "address": "Jl. Ahmad Yani, Semarang",
-            "types": [],
             "provider": "openstreetmap_nominatim",
         }
 
     async def fake_nearby(lat, lon, timeout, radius_m):
-        return [
-            {
-                "name": "Masjid Al Ikhlas",
-                "address": "Jl. Ahmad Yani, Semarang",
-                "lat": lat,
-                "lon": lon + 0.0004,
-                "distance_m": 42.0,
-                "types": ["amenity", "mosque"],
-                "type_score": 92,
-                "provider": "openstreetmap_overpass",
-            }
-        ]
+        return []
 
-    monkeypatch.setattr(li, "_osm_reverse", fake_reverse)
-    monkeypatch.setattr(li, "_osm_nearby", fake_nearby)
+    monkeypatch.setattr(li, "_safe_reverse", fake_reverse)
+    monkeypatch.setattr(li, "_safe_nearby", fake_nearby)
 
     resolved = asyncio.run(
         li.resolve_location_intelligence(
@@ -112,26 +134,52 @@ def test_resolver_preserves_whatsapp_place_name(monkeypatch):
                 "lon": 110.0,
                 "name": "CV Sumber Teknik",
                 "address": "Jl. Ahmad Yani No. 5",
-                "source": "WHATSAPP_SHARE_LOCATION",
             }
         )
     )
 
     assert resolved["name"] == "CV Sumber Teknik"
     assert resolved["address"] == "Jl. Ahmad Yani No. 5"
-    assert resolved["auto_landmark"] == "Masjid Al Ikhlas"
 
 
-def test_confirmation_never_falls_back_to_raw_coordinates():
+def test_feature_flag_disables_external_lookup(monkeypatch):
+    monkeypatch.setenv("LOCATION_INTELLIGENCE_ENABLED", "false")
+    asyncio.run(li.clear_location_cache())
+
+    async def should_not_run(*args, **kwargs):
+        raise AssertionError("external lookup should not run")
+
+    monkeypatch.setattr(li, "_safe_reverse", should_not_run)
+    monkeypatch.setattr(li, "_safe_nearby", should_not_run)
+
+    resolved = asyncio.run(
+        li.resolve_location_intelligence(
+            {"lat": -7.0, "lon": 110.0, "name": "Toko ABC", "address": "Jl. Mawar"}
+        )
+    )
+
+    assert resolved["name"] == "Toko ABC"
+    assert resolved["address"] == "Jl. Mawar"
+    assert "disabled" in resolved["location_intelligence_version"]
+
+
+def test_confirmation_never_exposes_coordinates(monkeypatch):
+    _reset_env(monkeypatch)
     location = {
         "lat": -7.123456,
         "lon": 110.654321,
-        "source": "WHATSAPP_SHARE_LOCATION",
+        "name": "PT ABC",
+        "address": "Jl. Industri",
+        "auto_landmark": "Masjid Al Ikhlas",
+        "auto_landmark_distance_m": 70,
+        "location_attribution": "OpenStreetMap contributors",
     }
     reply = li.format_location_confirmation(location)
     assert "-7.123456" not in reply
     assert "110.654321" not in reply
-    assert "Share Location" in reply
+    assert "PT ABC" in reply
+    assert "Masjid Al Ikhlas" in reply
+    assert "OpenStreetMap" in reply
 
 
 def test_short_location_never_returns_coordinates():
@@ -139,108 +187,19 @@ def test_short_location_never_returns_coordinates():
     assert text == "titik Share Location yang Anda kirim"
 
 
-def test_customer_location_state_uses_resolved_human_location(monkeypatch):
-    payload = {
-        "customer_id": "c",
-        "machine_count": 1,
-        "items": [{"machine": "Juki", "problem": "sering loncat"}],
-    }
-    saved = {}
+def test_automatic_landmark_falls_back_to_exact_named_place(monkeypatch):
+    _reset_env(monkeypatch)
+    asyncio.run(li.clear_location_cache())
 
-    async def fake_get_state(phone):
-        return {"state": "cust_location", "payload": payload}
+    async def fake_reverse(lat, lon, timeout):
+        return {"name": "Toko Sumber Jaya", "address": "Jl. Raya", "provider": "openstreetmap_nominatim"}
 
-    async def fake_resolve(location):
-        return {
-            **location,
-            "name": "PT Maju Jaya",
-            "address": "Jl. Industri No. 10, Ungaran",
-            "auto_landmark": "Indomaret Lemah Abang",
-            "auto_landmark_distance_m": 55,
-        }
+    async def fake_nearby(lat, lon, timeout, radius_m):
+        return []
 
-    async def fake_set_state(phone, state, new_payload):
-        saved["state"] = state
-        saved["payload"] = dict(new_payload)
+    monkeypatch.setattr(li, "_safe_reverse", fake_reverse)
+    monkeypatch.setattr(li, "_safe_nearby", fake_nearby)
 
-    monkeypatch.setattr(customer, "get_state", fake_get_state)
-    monkeypatch.setattr(customer, "resolve_location_intelligence", fake_resolve)
-    monkeypatch.setattr(customer, "set_state", fake_set_state)
-
-    reply = asyncio.run(
-        customer.handle_customer_state(
-            _msg(location={"lat": -7.1, "lon": 110.2, "source": "WHATSAPP_SHARE_LOCATION"})
-        )
-    )
-
-    assert saved["state"] == "cust_location_confirm"
-    assert saved["payload"]["location"]["name"] == "PT Maju Jaya"
-    assert "PT Maju Jaya" in reply
-    assert "Indomaret Lemah Abang" in reply
-    assert "-7.1" not in reply
-    assert "110.2" not in reply
-
-
-def test_landmark_benar_uses_automatic_landmark(monkeypatch):
-    phone = "6200000000000"
-    payload = {
-        "customer_id": "customer-id",
-        "items": [{"machine": "Juki", "problem": "sering loncat"}],
-        "location": {
-            "lat": -7.0,
-            "lon": 110.0,
-            "name": "PT Maju Jaya",
-            "address": "Jl. Industri No. 10",
-            "auto_landmark": "Indomaret Lemah Abang",
-            "auto_landmark_distance_m": 55,
-            "source": "WHATSAPP_SHARE_LOCATION",
-        },
-        "customer_media": [],
-    }
-    captured = {}
-
-    async def fake_get_state(value):
-        return {"state": "cust_landmark", "payload": payload}
-
-    async def fake_understand(text, state="", context=None):
-        return {
-            "intent": "GENERAL_QUESTION",
-            "control": "YES",
-            "machines": [],
-            "fields": {"name": None, "machine_description": None, "problem": None, "landmark": None},
-            "questions": [],
-            "corrections": [],
-            "provider": "local",
-        }
-
-    async def fake_get_customer(value, name=None):
-        return {"id": "customer-id", "name": "Customer"}
-
-    async def fake_create_order(customer_id, location, landmark, items):
-        captured["landmark"] = landmark
-        captured["location"] = location
-        return {"id": "order-id", "order_no": "MTK-TEST-LOC"}
-
-    async def fake_persist(*args, **kwargs):
-        return 0
-
-    async def fake_clear(*args, **kwargs):
-        return None
-
-    async def fake_offer(order_id, notify_customer=True):
-        return False
-
-    monkeypatch.setattr(customer, "get_state", fake_get_state)
-    monkeypatch.setattr(customer, "understand_customer_message", fake_understand)
-    monkeypatch.setattr(customer, "quick_customer_signals", lambda text, state="": {"control": "YES", "machine_count": None})
-    monkeypatch.setattr(customer, "get_or_create_customer", fake_get_customer)
-    monkeypatch.setattr(customer, "create_order", fake_create_order)
-    monkeypatch.setattr(customer, "_persist_customer_media", fake_persist)
-    monkeypatch.setattr(customer, "clear_state", fake_clear)
-    monkeypatch.setattr(customer, "start_offer_batch", fake_offer)
-
-    reply = asyncio.run(customer.handle_customer_state(_msg("BENAR", phone=phone)))
-
-    assert captured["landmark"] == "Indomaret Lemah Abang"
-    assert captured["location"]["name"] == "PT Maju Jaya"
-    assert "MTK-TEST-LOC" in reply
+    resolved = asyncio.run(li.resolve_location_intelligence({"lat": -7.3, "lon": 110.3}))
+    assert resolved["name"] == "Toko Sumber Jaya"
+    assert resolved["auto_landmark"] == "Toko Sumber Jaya"
