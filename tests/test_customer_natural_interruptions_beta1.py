@@ -846,3 +846,173 @@ def test_media_finish_plus_warranty_question_advances_and_answers(monkeypatch):
     assert saved["state"] == "cust_landmark"
     assert "garansi" in reply.lower()
     assert "patokan" in reply.lower()
+
+
+def test_natural_service_request_detector_handles_indonesian_and_javanese():
+    assert customer._looks_like_service_request("Bisa bantu perbaiki mas?")
+    assert customer._looks_like_service_request("Tulung ndandani mesinku mas")
+    assert customer._looks_like_service_request("Saya mau servis")
+    assert not customer._looks_like_service_request("Mesin ini bisa diperbaiki tidak?")
+    assert not customer._looks_like_service_request("Tidak jadi servis dulu mas")
+
+
+def test_price_context_bisa_bantu_perbaiki_starts_intake_with_remembered_context(monkeypatch):
+    payload = {
+        "customer_id": "customer-id",
+        "items": [],
+        "prefill_machines": [
+            {"machine": "Juki", "problem": "sering loncat"}
+        ],
+    }
+    captured = {}
+
+    async def fake_get_state(phone):
+        return {"state": "cust_price_context", "payload": payload}
+
+    async def fake_understand(text, state="", context=None):
+        return {
+            "intent": "GENERAL_QUESTION",
+            "control": "NONE",
+            "machine_count": None,
+            "machines": [],
+            "fields": {
+                "name": None,
+                "machine_description": None,
+                "problem": None,
+                "landmark": None,
+            },
+            "normalized_text": text,
+            "requires_clarification": False,
+        }
+
+    async def fake_clear_state(phone):
+        captured["cleared"] = True
+
+    async def fake_start_intake(msg, classified):
+        captured["classified"] = classified
+        return "Ada berapa unit mesin yang ingin dicek?"
+
+    monkeypatch.setattr(customer, "get_state", fake_get_state)
+    monkeypatch.setattr(customer, "understand_customer_message", fake_understand)
+    monkeypatch.setattr(customer, "clear_state", fake_clear_state)
+    monkeypatch.setattr(customer, "_start_intake", fake_start_intake)
+    monkeypatch.setattr(
+        customer,
+        "quick_customer_signals",
+        lambda text, state="": {"control": "NONE", "machine_count": None},
+    )
+
+    reply = asyncio.run(
+        customer.handle_customer_state(_msg("Bisa bantu perbaiki mas?"))
+    )
+
+    assert captured["cleared"] is True
+    assert captured["classified"]["machines"] == [
+        {"machine": "Juki", "problem": "sering loncat"}
+    ]
+    assert "bisa, saya bantu proses" in reply.lower()
+    assert "berapa unit mesin" in reply.lower()
+    assert "tinggal bilang" not in reply.lower()
+
+
+def test_price_context_problem_followup_continues_service_instead_of_generic_chat(monkeypatch):
+    payload = {
+        "customer_id": "customer-id",
+        "items": [],
+        "prefill_machines": [
+            {"machine": "Juki", "problem": ""}
+        ],
+    }
+    captured = {}
+
+    async def fake_get_state(phone):
+        return {"state": "cust_price_context", "payload": payload}
+
+    async def fake_understand(text, state="", context=None):
+        return {
+            "intent": "GENERAL_QUESTION",
+            "control": "NONE",
+            "machine_count": None,
+            "machines": [],
+            "fields": {
+                "name": None,
+                "machine_description": None,
+                "problem": None,
+                "landmark": None,
+            },
+            "normalized_text": text,
+            "requires_clarification": False,
+        }
+
+    async def fake_clear_state(phone):
+        return None
+
+    async def fake_start_intake(msg, classified):
+        captured["classified"] = classified
+        return "Ada berapa unit mesin yang ingin dicek?"
+
+    async def should_not_general(*args, **kwargs):
+        raise AssertionError("Keluhan lanjutan tidak boleh jatuh ke generic chat")
+
+    monkeypatch.setattr(customer, "get_state", fake_get_state)
+    monkeypatch.setattr(customer, "understand_customer_message", fake_understand)
+    monkeypatch.setattr(customer, "clear_state", fake_clear_state)
+    monkeypatch.setattr(customer, "_start_intake", fake_start_intake)
+    monkeypatch.setattr(customer, "conversational_customer_reply", should_not_general)
+    monkeypatch.setattr(
+        customer,
+        "quick_customer_signals",
+        lambda text, state="": {"control": "NONE", "machine_count": None},
+    )
+
+    reply = asyncio.run(
+        customer.handle_customer_state(_msg("Masalahnya loncat mas"))
+    )
+
+    machines = captured["classified"]["machines"]
+    assert machines[0]["machine"] == "Juki"
+    assert "loncat" in machines[0]["problem"].lower()
+    assert "keluhannya saya catat" in reply.lower()
+    assert "berapa unit mesin" in reply.lower()
+
+
+def test_top_level_bisa_bantu_perbaiki_starts_service_even_if_ai_says_general(monkeypatch):
+    captured = {}
+
+    async def fake_state(msg):
+        return None
+
+    async def fake_active(phone):
+        return None
+
+    async def fake_understand(text, state="", context=None):
+        return {
+            "intent": "GENERAL_QUESTION",
+            "control": "NONE",
+            "machine_count": None,
+            "machines": [],
+            "fields": {
+                "name": None,
+                "machine_description": None,
+                "problem": None,
+                "landmark": None,
+            },
+            "normalized_text": text,
+            "requires_clarification": False,
+        }
+
+    async def fake_start_intake(msg, classified):
+        captured["called"] = True
+        return "INTAKE"
+
+    monkeypatch.setattr(customer, "handle_customer_state", fake_state)
+    monkeypatch.setattr(customer, "active_order_for_customer", fake_active)
+    monkeypatch.setattr(customer, "understand_customer_message", fake_understand)
+    monkeypatch.setattr(customer, "_start_intake", fake_start_intake)
+
+    reply = asyncio.run(
+        customer.handle_customer_message(_msg("Bisa bantu perbaiki mas?"))
+    )
+
+    assert captured["called"] is True
+    assert reply == "INTAKE"
