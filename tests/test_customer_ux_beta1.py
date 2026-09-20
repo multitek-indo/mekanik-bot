@@ -81,8 +81,42 @@ def test_price_question_during_media_flow_keeps_conversation(monkeypatch):
         assert context_items[0]["machine"] == "Juki jarum satu"
         return "JAWABAN HARGA"
 
+    async def fake_understand(text, state="", context=None):
+        return {
+            "intent": "PRICE_QUESTION",
+            "control": "NONE",
+            "speech_acts": ["QUESTION"],
+            "service_requested": False,
+            "answers_current_slot": False,
+            "machine_count": None,
+            "machines": [],
+            "fields": {
+                "name": None,
+                "machine_description": None,
+                "problem": None,
+                "landmark": None,
+            },
+            "questions": [
+                {
+                    "topic": "PRICE",
+                    "text": text,
+                }
+            ],
+            "corrections": [],
+            "normalized_text": text,
+            "language_style": "INDONESIA_CASUAL",
+            "confidence": 1.0,
+            "requires_clarification": False,
+            "provider": "local",
+        }
+
     monkeypatch.setattr(customer, "get_state", fake_get_state)
     monkeypatch.setattr(customer, "price_answer", fake_price_answer)
+    monkeypatch.setattr(
+        customer,
+        "understand_customer_message",
+        fake_understand,
+    )
 
     reply = asyncio.run(
         customer.handle_customer_state(
@@ -90,8 +124,10 @@ def test_price_question_during_media_flow_keeps_conversation(monkeypatch):
         )
     )
 
+    low = reply.lower()
     assert "JAWABAN HARGA" in reply
-    assert "foto/video" in reply.lower()
+    assert "foto" in low
+    assert "video" in low
     assert "Juki jarum satu" in reply
 
 
