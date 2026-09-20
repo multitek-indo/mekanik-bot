@@ -17,7 +17,13 @@ from .conversation import (
 )
 from .config import settings
 from .db import pool
-from .location import location_label, haversine_km
+from .location import haversine_km
+from .location_intelligence import (
+    automatic_landmark,
+    format_location_confirmation,
+    format_location_short,
+    resolve_location_intelligence,
+)
 from .matching import start_offer_batch
 from .media import is_real_media_file
 from .orders import (
@@ -1103,15 +1109,32 @@ def _media_machine_label(payload: dict, item_no: int) -> str:
     return f"mesin ke-{item_no}"
 
 
+def _automatic_landmark_from_payload(payload: dict) -> str:
+    return automatic_landmark(payload.get("location") or {})
+
+
+def _landmark_prompt(payload: dict) -> str:
+    auto = _automatic_landmark_from_payload(payload)
+    if auto:
+        return (
+            f"Saya menemukan patokan otomatis dari titik lokasi: *{auto}*. "
+            "Kalau patokan ini sudah tepat, jawab *BENAR*. "
+            "Kalau ingin diganti, cukup tulis patokan yang lebih jelas, "
+            "misalnya nama PT/CV/toko, gate, pos security, warna pagar, atau bangunan terdekat."
+        )
+    return (
+        "Ada nama tempat atau patokan agar mekanik mudah menemukan lokasi? "
+        "Contohnya nama PT/CV/toko, gate, pos security, masjid, minimarket, "
+        "atau ciri rumah. Kalau tidak ada, cukup jawab *tidak ada*."
+    )
+
+
 async def _begin_customer_media(phone: str, payload: dict) -> str:
     items = list(payload.get("items") or [])
 
     if not items:
         await set_state(phone, "cust_landmark", payload)
-        return (
-            "Ada nama tempat atau patokan agar mekanik mudah menemukan lokasi? "
-            "Kalau tidak ada, cukup jawab *tidak ada*."
-        )
+        return _landmark_prompt(payload)
 
     payload.setdefault("customer_media", [])
     payload["media_item_no"] = 1
@@ -1153,11 +1176,7 @@ async def _advance_customer_media(phone: str, payload: dict) -> str:
     payload.pop("media_item_no", None)
     await set_state(phone, "cust_landmark", payload)
 
-    return (
-        "Baik, referensi mesin sudah selesai. "
-        "Ada nama tempat atau patokan agar mekanik mudah menemukan lokasi? "
-        "Kalau tidak ada, cukup jawab *tidak ada*."
-    )
+    return "Baik, referensi mesin sudah selesai. " + _landmark_prompt(payload)
 
 
 async def _persist_customer_media(
@@ -2707,22 +2726,17 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 )
             return "Mohon kirim lokasi mesin menggunakan fitur *Share Location* WhatsApp."
 
-        payload["location"] = msg.location
+        resolved_location = await resolve_location_intelligence(msg.location)
+        payload["location"] = resolved_location
         await set_state(msg.phone, "cust_location_confirm", payload)
-        return (
-            f"Lokasi yang saya terima: *{location_label(msg.location)}*\n"
-            "Apakah ini benar lokasi mesin yang akan diservis? "
-            "Boleh jawab *iya*, *bener*, *nggih*, atau kirim Share Location ulang jika salah."
-        )
+        return format_location_confirmation(resolved_location)
 
     if st == "cust_location_confirm":
         if msg.location:
-            payload["location"] = msg.location
+            resolved_location = await resolve_location_intelligence(msg.location)
+            payload["location"] = resolved_location
             await set_state(msg.phone, "cust_location_confirm", payload)
-            return (
-                f"Lokasi diperbarui menjadi *{location_label(msg.location)}*. "
-                "Apakah titik ini sudah benar?"
-            )
+            return format_location_confirmation(resolved_location)
 
         control = quick.get("control")
         analysis = None
@@ -2780,10 +2794,7 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
 
         if not items:
             await set_state(msg.phone, "cust_landmark", payload)
-            return (
-                "Ada nama tempat atau patokan agar mekanik mudah menemukan lokasi? "
-                "Kalau tidak ada, cukup jawab *tidak ada*."
-            )
+            return _landmark_prompt(payload)
 
         try:
             item_no = int(payload.get("media_item_no") or 1)
@@ -2945,6 +2956,10 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
         )
 
         analysis = await understand() if text else {}
+        if control not in {"YES", "NO", "SKIP"}:
+            ai_control = str(analysis.get("control") or "").upper()
+            if ai_control in {"YES", "NO", "SKIP"}:
+                control = ai_control
         correction_notes = await apply_explicit_corrections(analysis) if text and _v4_correction_signal(text, analysis) else []
         if correction_notes:
             corrected_state, correction_reply = await _reconcile_after_correction(
@@ -2981,13 +2996,26 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             if side is not None:
                 return side
 
-        if no_landmark:
+        auto_landmark = _automatic_landmark_from_payload(payload)
+        use_auto_landmark = bool(auto_landmark) and (
+            control == "YES"
+            or low_landmark in {
+                "benar", "betul", "iya", "ya", "nggih", "nggeh", "oke", "ok",
+                "cukup", "sudah cukup", "udah cukup", "wis cukup", "wes cukup",
+            }
+        )
+
+        if use_auto_landmark:
+            landmark = auto_landmark[:500]
+        elif no_landmark:
             landmark = ""
         elif landmark_from_ai:
             landmark = landmark_from_ai[:500]
         elif landmark_fallback:
             landmark = landmark_fallback[:500]
         else:
+            if auto_landmark:
+                return _landmark_prompt(payload)
             return (
                 "Saya belum menangkap patokannya. Contohnya *depan masjid*, "
                 "*sebelah Indomaret*, atau *rumah pagar hitam*. Kalau tidak ada, "
@@ -3062,6 +3090,8 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             await clear_state(msg.phone)
             return "Nomor service tidak ditemukan."
 
+        resolved_location = await resolve_location_intelligence(msg.location)
+
         async with pool().acquire() as conn:
             tech = None
             if order["assigned_technician_id"]:
@@ -3074,8 +3104,8 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
             lat = tech["current_lat"] if tech["current_lat"] is not None else tech["base_lat"]
             lon = tech["current_lon"] if tech["current_lon"] is not None else tech["base_lon"]
             new_distance = haversine_km(
-                msg.location["lat"],
-                msg.location["lon"],
+                resolved_location["lat"],
+                resolved_location["lon"],
                 float(lat),
                 float(lon),
             )
@@ -3111,23 +3141,26 @@ async def handle_customer_state(msg: IncomingMessage) -> str | None:
                 )
 
         async with pool().acquire() as conn:
+            new_landmark = automatic_landmark(resolved_location)
             await conn.execute(
                 """UPDATE service_orders
                    SET location_lat=$2,location_lon=$3,location_name=$4,
                        location_address=$5,location_source=$6,
+                       location_landmark=CASE WHEN $7 <> '' THEN $7 ELSE location_landmark END,
                        location_confirmed=true,updated_at=now()
                    WHERE id=$1""",
                 order["id"],
-                msg.location["lat"],
-                msg.location["lon"],
-                msg.location.get("name") or "",
-                msg.location.get("address") or "",
-                msg.location.get("source") or "WHATSAPP_SHARE_LOCATION",
+                resolved_location["lat"],
+                resolved_location["lon"],
+                resolved_location.get("name") or "",
+                resolved_location.get("address") or "",
+                resolved_location.get("source") or "WHATSAPP_SHARE_LOCATION",
+                new_landmark[:500],
             )
 
         await clear_state(msg.phone)
         return (
-            f"Lokasi {order_no} sudah diperbarui. "
+            f"Lokasi {order_no} sudah diperbarui ke *{format_location_short(resolved_location)}*. "
             f"Balas *LOKASI BENAR {order_no}* untuk mengizinkan mekanik berangkat."
         )
 
